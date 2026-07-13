@@ -1,0 +1,4 @@
+company_name,ticker,sector,revenue_usd_m,operating_income_usd_m,net_income_usd_m,unit,frequency,source_note
+Apple Inc.,APPL,consumer technology,1000,300,250,USD million,annual_sample,class_sample
+Microsoft Corporation,MSFT,software and cloud,900,320,260,USD million,annual_sample,class_sample
+NVIDIA Corporation,NVDA,semiconductor,700,280,220,USD million,annual_sample,class_sample
