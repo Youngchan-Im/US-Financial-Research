@@ -8,7 +8,7 @@ U.S. Financial Research Project는 미국 주요 기업의 재무지표와 거�
 
 미국 기업과 시장 데이터를 수집, 정리, 해석하는 과정을 기록한다. 결과는 리서치 노트와 데이터 분석 산출물로 관리한다.
 
-## Intersest company candidates
+## Interest company candidates
 
 `ticker`는 거래소에서 기업을 식별할 때 쓰는 짧은 기호다.
 
@@ -19,4 +19,9 @@ U.S. Financial Research Project는 미국 주요 기업의 재무지표와 거�
 | JPMorgan Chase & Co. | JPM | 금리 환경과 금융업 실적의 관계를 살펴 볼 수 있음 |
 | Tesla, Inc. | TSLA | 성장 기업의 매출 확대와 수익성 변화를 볼 수 있음 |
 | Walmart Inc. | WMT | 소비 경기와 대형 유통 기업의 흐름을 비교할 수 있음 |
+| Meta Platforms, Inc. | META | 소셜 미디어와 디지털 광고 중심의 사업 구조를 살펴볼 수 있음 |
+| Amazon.com, Inc. | AMZN | 전자상거래와 클라우드 사업 구조를 함께 살펴볼 수 있음 |
+| NVIDIA Corporation | NVDA | AI 반도체와 데이터센터 사업의 성장 흐름을 살펴볼 수 있음 |
+| Alphabet Inc. | GOOGL | 검색 광고와 클라우드 중심 사업 구조를 살펴볼 수 있음 |
+| Advanced Micro Devices, Inc. | AMD | AI 반도체와 고성능 컴퓨팅 사업의 경쟁 구조를 살펴볼 수 있음 |
 
