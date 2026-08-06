@@ -1,0 +1,468 @@
+from pathlib import Path
+import json
+import os
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import urlopen
+
+import pandas as pd
+from dotenv import load_dotenv
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+ENV_PATH = PROJECT_ROOT / ".env"
+OUTPUT_CSV_PATH = PROJECT_ROOT / "data" / "macro_data.csv"
+
+FRED_OBSERVATIONS_ENDPOINT = (
+    "https://api.stlouisfed.org/fred/series/observations"
+)
+
+SERIES_IDS = [
+    "UNRATE",
+    "FEDFUNDS",
+    "CPIAUCSL",
+    "DGS10",
+    "T10Y2Y",
+]
+
+SERIES_METADATA = {
+    "UNRATE": {
+        "series_name": "Unemployment Rate",
+        "unit": "Percent",
+        "frequency": "Monthly",
+        "seasonal_adjustment": "Seasonally Adjusted",
+        "source_name": "U.S. Bureau of Labor Statistics",
+    },
+    "FEDFUNDS": {
+        "series_name": "Federal Funds Effective Rate",
+        "unit": "Percent",
+        "frequency": "Monthly",
+        "seasonal_adjustment": "Not Seasonally Adjusted",
+        "source_name": (
+            "Board of Governors of the Federal Reserve System (US)"
+        )
+    },
+    "CPIAUCSL": {
+        "series_name": (
+            "Consumer Price Index for All Urban Consumers: All Items"
+        ),
+        "unit": "Index 1982-1984=100",
+        "frequency": "Monthly",
+        "seasonal_adjustment": "Seasonally Adjusted",
+        "source_name": "U.S. Bureau of Labor Statistics",
+    },
+    "DGS10": {
+        "series_name": (
+            "10-Year Treasury Constant Maturity Market Yield"
+        ),
+        "unit": "Percent",
+        "frequency": "Daily",
+        "seasonal_adjustment": "Not Seasonally Adjusted",
+        "source_name": "Board of Governors of the Federal Reserve System (US)",
+    },
+    "T10Y2Y": {
+        "series_name": (
+            "10-Year Treasury Constant Maturity Minus "
+            "2-Year Treasury Constant Maturity"
+        ),
+        "unit": "Percent",
+        "frequency": "Daily",
+        "seasonal_adjustment": "Not Seasonally Adjusted",
+        "source_name": "Federal Reserve Bank of St. Louis",
+    },
+}
+
+OBSERVATION_START = "2019-01-01"
+OBSERVATION_END = "2024-12-31"
+SORT_ORDER = "asc"
+REQUEST_TIMEOUT_SECONDS = 30
+
+
+def load_fred_api_key(env_path):
+    """U.S. Financial Research Project 전용 .env에서 key를 읽는다."""
+    load_dotenv(dotenv_path=env_path, override=False)
+    fred_api_key = os.getenv("FRED_API_KEY")
+
+    invalid_key_values = {
+        None,
+        "",
+        "replace_with_your_fred_api_key",
+    }
+
+    if fred_api_key in invalid_key_values:
+        raise ValueError(
+            "FRED_API_KEY가 준비되지 않았습니다. "
+            "프로젝트 루트의 .env를 확인하세요."
+        )
+
+    return fred_api_key
+
+
+def fetch_fred_series(
+        series_id,
+        api_key,
+        observation_start,
+        observation_end,
+):
+    """FRED series 하나를 date와 series ID column으로 반환한다."""
+    request_params = {
+        "series_id": series_id,
+        "api_key": api_key,
+        "file_type": "json",
+        "observation_start": observation_start,
+        "observation_end": observation_end,
+        "sort_order": SORT_ORDER,
+    }
+
+    safe_request_params = {
+        **request_params,
+        "api_key": "***",
+    }
+    safe_request_text = json.dumps(
+        safe_request_params,
+        sort_keys=True,
+    )
+
+    print("request_series_id:", series_id)
+    print("safe_request_params:", safe_request_params)
+    print(
+        "actual_key_hidden_in_preview:",
+        api_key not in safe_request_text,
+    )
+
+    request_query = urlencode(request_params)
+    request_url_with_key = (
+        f"{FRED_OBSERVATIONS_ENDPOINT}?{request_query}"
+    )
+
+    try:
+        with urlopen(
+            request_url_with_key,
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        ) as response:
+            response_status = response.status
+            response_content_type = response.headers.get_content_type()
+            response_text = response.read().decode("utf-8")
+    except HTTPError as error:
+        raise RuntimeError(
+            f"{series_id} request가 HTTP 상태 "
+            f"{error.code}로 실패했습니다."
+        ) from error
+    except URLError as error:
+        raise RuntimeError(
+            f"{series_id} request 연결에 실패했습니다: "
+            f"{error.reason}"
+        ) from error
+
+    if response_status != 200:
+        raise RuntimeError(
+            f"{series_id} request의 HTTP 상태가 "
+            f"200이 아닙니다: {response_status}"
+        )
+
+    try:
+        response_json = json.loads(response_text)
+    except json.JSONDecodeError as error:
+        raise ValueError(
+            f"{series_id} response를 JSON으로 변환하지 못했습니다."
+        ) from error
+
+    observations = response_json.get("observations", [])
+
+    if not observations:
+        raise ValueError(
+            f"{series_id} observations 목록이 비어 있습니다."
+        )
+
+    raw_series_df = pd.DataFrame(observations)
+    required_columns = {"date", "value"}
+    missing_required_columns = (
+        required_columns - set(raw_series_df.columns)
+    )
+
+    if missing_required_columns:
+        raise KeyError(
+            f"{series_id} 필수 column이 없습니다: "
+            f"{sorted(missing_required_columns)}"
+        )
+
+    series_df = raw_series_df[["date", "value"]].rename(
+        columns={"value": series_id}
+    ).copy()
+
+    series_df["date"] = pd.to_datetime(
+        series_df["date"],
+        errors="coerce",
+    )
+    series_df[series_id] = pd.to_numeric(
+        series_df[series_id],
+        errors="coerce",
+    )
+
+    series_df = series_df.sort_values("date").reset_index(
+        drop=True
+    )
+
+    date_missing_count = series_df["date"].isna().sum()
+    duplicate_date_count = series_df["date"].duplicated().sum()
+    value_missing_count = series_df[series_id].isna().sum()
+
+    if date_missing_count != 0:
+        raise ValueError(
+            f"{series_id}에 변환되지 않은 날짜가 있습니다: "
+            f"{date_missing_count}"
+        )
+
+    if duplicate_date_count != 0:
+        raise ValueError(
+            f"{series_id}에 중복 날짜가 있습니다: "
+            f"{duplicate_date_count}"
+        )
+
+    if series_df[series_id].notna().sum() == 0:
+        raise ValueError(
+            f"{series_id}에 숫자로 변환된 관측값이 없습니다."
+        )
+
+    print("response_status:", response_status)
+    print("response_content_type:", response_content_type)
+    print("returned_row_count:", len(series_df))
+    print("value_missing_count:", value_missing_count)
+    print("first_date:", series_df["date"].min().date())
+    print("last_date:", series_df["date"].max().date())
+    print("date_is_monotonic:", series_df["date"].is_monotonic_increasing)
+    print("-" * 60)
+
+    return series_df
+
+
+def collect_fred_series(
+        series_ids,
+        api_key,
+        observation_start,
+        observation_end,
+):
+    """series ID 목록을 반복해 DataFrame 딕셔너리를 만든다."""
+    if len(series_ids) != len(set(series_ids)):
+        raise ValueError("SERIES_IDS에 중복된 series ID가 있습니다.")
+
+    series_frames = {}
+
+    for series_id in series_ids:
+        series_frames[series_id] = fetch_fred_series(
+            series_id=series_id,
+            api_key=api_key,
+            observation_start=observation_start,
+            observation_end=observation_end,
+        )
+
+    return series_frames
+
+
+def merge_fred_series(series_frames, series_ids):
+    """series별 DataFrame을 date 기준 outer 방식으로 병합한다."""
+    first_series_id = series_ids[0]
+    macro_df = series_frames[first_series_id].copy()
+
+    for series_id in series_ids[1:]:
+        macro_df = macro_df.merge(
+            series_frames[series_id],
+            on="date",
+            how="outer",
+            validate="one_to_one",
+        )
+
+    macro_df = macro_df.sort_values("date").reset_index(
+        drop=True
+    )
+    macro_df = macro_df[["date", *series_ids]]
+
+    return macro_df
+
+
+def validate_macro_data(
+    macro_df,
+    series_frames,
+    series_ids,
+    observation_start,
+    observation_end,
+):
+    """병합 결과의 column, 날짜, 월별 관측 수를 확인한다."""
+    expected_columns = ["date", *series_ids]
+
+    if list(macro_df.columns) != expected_columns:
+        raise ValueError(
+            "병합 결과 column 순서가 다릅니다: "
+            f"{list(macro_df.columns)}"
+        )
+
+    if macro_df["date"].isna().sum() != 0:
+        raise ValueError("병합 결과에 결측 날짜가 있습니다.")
+
+    if macro_df["date"].duplicated().sum() != 0:
+        raise ValueError("병합 결과에 중복 날짜가 있습니다.")
+
+    if not macro_df["date"].is_monotonic_increasing:
+        raise ValueError("병합 결과의 날짜가 오름차순이 아닙니다.")
+
+    expected_monthly_dates = pd.date_range(
+        start=observation_start,
+        end=observation_end,
+        freq="MS",
+    )
+    expected_monthly_date_set = set(expected_monthly_dates)
+
+    monthly_series_ids = [
+        "UNRATE",
+        "FEDFUNDS",
+        "CPIAUCSL",
+    ]
+
+    for series_id in monthly_series_ids:
+        actual_date_set = set(series_frames[series_id]["date"])
+        missing_months = sorted(
+            expected_monthly_date_set - actual_date_set
+        )
+        extra_dates = sorted(
+            actual_date_set - expected_monthly_date_set
+        )
+
+        print(
+            f"{series_id}_expected_month_count:",
+            len(expected_monthly_dates),
+        )
+        print(
+            f"{series_id}_actual_month_count:",
+            len(series_frames[series_id]),
+        )
+        print(
+            f"{series_id}_missing_month_count:",
+            len(missing_months),
+        )
+        print(
+            f"{series_id}_extra_date_count:",
+            len(extra_dates),
+        )
+
+        if missing_months or extra_dates:
+            raise ValueError(
+                f"{series_id}의 월별 날짜 구성 예상과 다릅니다."
+            )
+
+    largest_source_row_count = max(
+        len(series_df)
+        for series_df in series_frames.values()
+    )
+    merged_row_count_valid = (
+        len(macro_df) >= largest_source_row_count
+    )
+
+    if not merged_row_count_valid:
+        raise ValueError(
+            "outer 병합 결과가 가장 긴 원본 DataFrame보다 짧습니다."
+        )
+
+    missing_summary = macro_df[series_ids].isna().sum()
+
+    print("macro_row_count:", len(macro_df))
+    print("macro_column_count:", len(macro_df.columns))
+    print("macro_columns:", list(macro_df.columns))
+    print("macro_first_date:", macro_df["date"].min().date())
+    print("macro_last_date:", macro_df["date"].max().date())
+    print("merged_row_count_valid:", merged_row_count_valid)
+    print("macro_missing_summary:")
+    print(missing_summary)
+
+
+def save_and_check_macro_data(macro_df, output_csv_path):
+    """병합 결과를 CSV로 저장하고 다시 읽어 형태를 확인한다."""
+    if not output_csv_path.parent.exists():
+        raise FileNotFoundError(
+            "data 폴더가 없습니다. 프로젝트 루트에 "
+            "data 폴더를 만든 뒤 다시 실행하세요."
+        )
+
+    macro_df.to_csv(
+        output_csv_path,
+        index=False,
+        date_format="%Y-%m-%d",
+    )
+
+    saved_macro_df = pd.read_csv(
+        output_csv_path,
+        parse_dates=["date"],
+    )
+
+    if len(saved_macro_df) != len(macro_df):
+        raise ValueError("저장 전후 row 수가 다릅니다.")
+
+    if list(saved_macro_df.columns) != list(macro_df.columns):
+        raise ValueError("저장 전후 column 목록이 다릅니다.")
+
+    if saved_macro_df["date"].duplicated().sum() != 0:
+        raise ValueError("저장된 CSV에 중복 날짜가 있습니다.")
+
+    print("saved_csv_path:", output_csv_path)
+    print("saved_csv_exists:", output_csv_path.exists())
+    print("saved_row_count:", len(saved_macro_df))
+    print("saved_column_count:", len(saved_macro_df.columns))
+    print("saved_columns:", list(saved_macro_df.columns))
+    print("saved_first_date:", saved_macro_df["date"].min().date())
+    print("saved_last_date:", saved_macro_df["date"].max().date())
+
+    return saved_macro_df
+
+
+def main():
+    print("project_root:", PROJECT_ROOT)
+    print("env_file_exists:", ENV_PATH.exists())
+    print("output_csv_path:", OUTPUT_CSV_PATH)
+    print("observation_start:", OBSERVATION_START)
+    print("observation_end:", OBSERVATION_END)
+    print("series_ids:", SERIES_IDS)
+
+    for series_id in SERIES_IDS:
+        metadata = SERIES_METADATA[series_id]
+        print(
+            "series_metadata:",
+            series_id,
+            metadata["unit"],
+            metadata["frequency"],
+            metadata["seasonal_adjustment"],
+            metadata["source_name"],
+        )
+
+    fred_api_key = load_fred_api_key(ENV_PATH)
+    print("fred_api_key_loaded:", True)
+
+    series_frames = collect_fred_series(
+        series_ids=SERIES_IDS,
+        api_key=fred_api_key,
+        observation_start=OBSERVATION_START,
+        observation_end=OBSERVATION_END,
+    )
+
+    macro_df = merge_fred_series(
+        series_frames=series_frames,
+        series_ids=SERIES_IDS,
+    )
+
+    validate_macro_data(
+        macro_df=macro_df,
+        series_frames=series_frames,
+        series_ids=SERIES_IDS,
+        observation_start=OBSERVATION_START,
+        observation_end=OBSERVATION_END,
+    )
+
+    saved_macro_df = save_and_check_macro_data(
+        macro_df=macro_df,
+        output_csv_path=OUTPUT_CSV_PATH,
+    )
+
+    print("collection_complete:", True)
+    print(saved_macro_df.head())
+
+
+if __name__ == "__main__":
+    main()

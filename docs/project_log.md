@@ -42,3 +42,14 @@
   - frequency: annual_sample
   - source_note: class_sample
   - limit: 실습용 가상 값이며 실제 재무제표 데이터가 아님
+
+  ## 2026-08-06
+
+  - session: 09
+  - topic: FRED 여러 지수 수집과 함수화
+  - created: `src/fred_api.py`
+  - created: `data/macro_data.csv`
+  - source: FRED series observations API
+  - obsercation period: `2019-01-01` to `2024-12-31`
+  - series: `UNRATE`, `FEDFUNDS`, `CPIAUCSL`, `DGS10`, `T10Y2Y`
+  
