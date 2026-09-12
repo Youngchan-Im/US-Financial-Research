@@ -3,19 +3,15 @@ from pathlib import Path
 import time
 
 import pandas as pd
-import requests 
+import requests
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CSV_OUTPUT_PATH = (
     PROJECT_ROOT
     / "data"
-    / "apple_financials_extended.csv"
+    / "us_finance_company_financials.csv"
 )
-
-APPLE_TICKER = "AAPL"
-APPLE_CIK_INT = 320193
-APPLE_CIK  = f"{APPLE_CIK_INT:010d}"
 
 SEC_COMPANYFACTS_URL_TEMPLATE = (
     "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
@@ -26,33 +22,83 @@ REQUEST_INTERVAL_SECONDS = 0.2
 FISCAL_YEAR_START = 2021
 FISCAL_YEAR_END = 2025
 
-METRIC_CONFIGS = {
-    "revenue": {
-        "concept_id": (
-            "RevenueFromContractWithCustomerExcludingAssessedTax"
-        ),
-        "fact_type": "duration",
+COMPANY_CONFIGS = {
+    "AAPL": {
+        "company_name": "Apple Inc.",
+        "cik_int": 320193,
+        "sector": "Technology",
+        "revenue_concepts": [
+            "RevenueFromContractWithCustomerExcludingAssessedTax",
+            "Revenues",
+        ],
     },
-    "net_income": {
-        "concept_id": "NetIncomeLoss",
-        "fact_type": "duration",
+    "MSFT": {
+        "company_name": "Microsoft Corporation",
+        "cik_int": 789019,
+        "sector": "Technology",
+        "revenue_concepts": [
+            "RevenueFromContractWithCustomerExcludingAssessedTax",
+            "Revenues",
+        ],
     },
-    "assets": {
-        "concept_id": "Assets",
-        "fact_type": "instant",
+    "JPM": {
+        "company_name": "JPMorgan Chase & Co.",
+        "cik_int": 19617,
+        "sector": "Banking",
+        "revenue_concepts": [
+            "Revenues",
+            "RevenueFromContractWithCustomerExcludingAssessedTax",
+        ],
     },
-    "liabilities": {
-        "concept_id": "Liabilities",
-        "fact_type": "instant",
+    "TSLA": {
+        "company_name": "Tesla, Inc.",
+        "cik_int": 1318605,
+        "sector": "Automotive and Energy",
+        "revenue_concepts": [
+            "RevenueFromContractWithCustomerExcludingAssessedTax",
+            "Revenues",
+        ],
     },
-    "operating_cash_flow": {
-        "concept_id": (
-            "NetCashProvidedByUsedInOperatingActivities"
-        ),
-        "fact_type": "duration",
+    "WMT": {
+        "company_name": "Walmart Inc.",
+        "cik_int": 104169,
+        "sector": "Retail",
+        "revenue_concepts": [
+            "RevenueFromContractWithCustomerExcludingAssessedTax",
+            "SalesRevenueNet",
+            "Revenues",
+        ],
     },
 }
 
+COMMON_METRIC_CONFIGS = {
+    "net_income": {
+        "fact_type": "duration",
+        "concept_candidates": ["NetIncomeLoss"],
+    },
+    "assets": {
+        "fact_type": "instant",
+        "concept_candidates": ["Assets"],
+    },
+    "liabilities": {
+        "fact_type": "instant",
+        "concept_candidates": ["Liabilities"],
+    },
+    "operating_cash_flow": {
+        "fact_type": "duration",
+        "concept_candidates": [
+            "NetCashProvidedByUsedInOperatingActivities"
+        ],
+    },
+}
+
+METRIC_NAMES = [
+    "revenue",
+    "net_income",
+    "assets",
+    "liabilities",
+    "operating_cash_flow",
+]
 DURATION_METRIC_NAMES = [
     "revenue",
     "net_income",
@@ -62,7 +108,6 @@ INSTANT_METRIC_NAMES = [
     "assets",
     "liabilities",
 ]
-
 METRIC_VALUE_COLUMNS = [
     "revenue_usd",
     "net_income_usd",
@@ -70,17 +115,22 @@ METRIC_VALUE_COLUMNS = [
     "liabilities_usd",
     "operating_cash_flow_usd",
 ]
-
+QUALITY_FLAG_COLUMNS = [
+    "duration_dates_match",
+    "instant_dates_match",
+    "period_end_matches_balance_sheet_date",
+]
 FINAL_COLUMNS = [
     "company_name",
     "ticker",
     "cik",
+    "sector",
     "fiscal_year",
     "period_start",
     "period_end",
     "balance_sheet_date",
     "revenue_usd",
-    "net_income_us",
+    "net_income_usd",
     "assets_usd",
     "liabilities_usd",
     "operating_cash_flow_usd",
@@ -101,11 +151,16 @@ FINAL_COLUMNS = [
     "operating_cash_flow_filed",
     "revenue_accn",
     "net_income_accn",
+    "assets_accn",
     "liabilities_accn",
     "operating_cash_flow_accn",
+    "duration_dates_match",
+    "instant_dates_match",
+    "period_end_matches_balance_sheet_date",
+    "metric_coverage_count",
+    "missing_metrics",
     "source",
 ]
-
 DATE_COLUMNS = [
     "period_start",
     "period_end",
@@ -134,9 +189,9 @@ def build_sec_headers(contact_email):
 
 
 def get_sec_json(
-        url,
-        headers,
-        pause_seconds=REQUEST_INTERVAL_SECONDS,
+    url,
+    headers,
+    pause_seconds=REQUEST_INTERVAL_SECONDS,
 ):
     if pause_seconds < 0:
         raise ValueError("pause_seconds는 0 이상이어야 합니다.")
@@ -159,8 +214,8 @@ def get_sec_json(
 
 
 def concept_usd_facts_to_df(
-        companyfacts_json,
-        concept_id,
+    companyfacts_json,
+    concept_id,
 ):
     try:
         concept_data = (
@@ -182,7 +237,6 @@ def concept_usd_facts_to_df(
         )
 
     required_columns = [
-        "start",
         "end",
         "val",
         "accn",
@@ -202,6 +256,9 @@ def concept_usd_facts_to_df(
             f"{concept_id} facts에 필요한 column이 없습니다: "
             f"{missing_columns}"
         )
+
+    if "start" not in facts_df.columns:
+        facts_df["start"] = pd.NaT
 
     facts_df["start"] = pd.to_datetime(
         facts_df["start"],
@@ -234,7 +291,7 @@ def select_latest_record_per_fiscal_year(facts_df):
         facts_df
         .sort_values(
             ["end", "filed", "accn"],
-            asending=[True, True, True],
+            ascending=[True, True, True],
         )
         .drop_duplicates(
             subset=["fiscal_year"],
@@ -246,11 +303,11 @@ def select_latest_record_per_fiscal_year(facts_df):
 
 
 def extract_annual_duration_facts(
-        companyfacts_json,
-        concept_id,
-        metric_name,
-        fiscal_year_start,
-        fiscal_year_end,
+    companyfacts_json,
+    concept_id,
+    metric_name,
+    fiscal_year_start,
+    fiscal_year_end,
 ):
     facts_df = concept_usd_facts_to_df(
         companyfacts_json=companyfacts_json,
@@ -291,7 +348,7 @@ def extract_annual_duration_facts(
             "val": f"{metric_name}_usd",
             "filed": f"{metric_name}_filed",
             "accn": f"{metric_name}_accn",
-            "duration": (
+            "duration_days": (
                 f"{metric_name}_duration_days"
             ),
             "concept_id": f"{metric_name}_concept",
@@ -313,11 +370,11 @@ def extract_annual_duration_facts(
 
 
 def extract_annual_instant_facts(
-        companyfacts_json,
-        concept_id,
-        metric_name,
-        fiscal_year_start,
-        fiscal_year_end,
+    companyfacts_json,
+    concept_id,
+    metric_name,
+    fiscal_year_start,
+    fiscal_year_end,
 ):
     facts_df = concept_usd_facts_to_df(
         companyfacts_json=companyfacts_json,
@@ -353,7 +410,7 @@ def extract_annual_instant_facts(
 
     annual_df = annual_df.rename(
         columns={
-            "end": f"{metric_name}_period_end",
+            "end": f"{metric_name}_balance_sheet_date",
             "val": f"{metric_name}_usd",
             "filed": f"{metric_name}_filed",
             "accn": f"{metric_name}_accn",
@@ -373,378 +430,575 @@ def extract_annual_instant_facts(
     return annual_df[output_columns]
 
 
-def merge_metric_frame(
-        left_df,
-        right_df,
-        metric_name,
+def empty_metric_frame(metric_name, fact_type):
+    if fact_type == "duration":
+        columns = [
+            "fiscal_year",
+            f"{metric_name}_period_start",
+            f"{metric_name}_period_end",
+            f"{metric_name}_usd",
+            f"{metric_name}_filed",
+            f"{metric_name}_accn",
+            f"{metric_name}_duration_days",
+            f"{metric_name}_concept",
+        ]
+    elif fact_type == "instant":
+        columns = [
+            "fiscal_year",
+            f"{metric_name}_balance_sheet_date",
+            f"{metric_name}_usd",
+            f"{metric_name}_filed",
+            f"{metric_name}_accn",
+            f"{metric_name}_concept",
+        ]
+    else:
+        raise ValueError(
+            f"지원하지 않는 fact_type입니다: {fact_type}"
+        )
+
+    return pd.DataFrame(columns=columns)
+
+
+def metric_config_for_company(company_config, metric_name):
+    if metric_name == "revenue":
+        return {
+            "fact_type": "duration",
+            "concept_candidates": company_config[
+                "revenue_concepts"
+            ],
+        }
+
+    return COMMON_METRIC_CONFIGS[metric_name]
+
+
+def resolve_metric_frame(
+    companyfacts_json,
+    company_config,
+    metric_name,
 ):
-    merged_df = left_df.merge(
+    config = metric_config_for_company(
+        company_config=company_config,
+        metric_name=metric_name,
+    )
+    fact_type = config["fact_type"]
+    target_year_count = (
+        FISCAL_YEAR_END - FISCAL_YEAR_START + 1
+    )
+
+    best_frame = empty_metric_frame(
+        metric_name=metric_name,
+        fact_type=fact_type,
+    )
+    best_concept = None
+    best_coverage = 0
+    candidate_results = []
+
+    for concept_id in config["concept_candidates"]:
+        try:
+            if fact_type == "duration":
+                candidate_frame = extract_annual_duration_facts(
+                    companyfacts_json=companyfacts_json,
+                    concept_id=concept_id,
+                    metric_name=metric_name,
+                    fiscal_year_start=FISCAL_YEAR_START,
+                    fiscal_year_end=FISCAL_YEAR_END,
+                )
+            else:
+                candidate_frame = extract_annual_instant_facts(
+                    companyfacts_json=companyfacts_json,
+                    concept_id=concept_id,
+                    metric_name=metric_name,
+                    fiscal_year_start=FISCAL_YEAR_START,
+                    fiscal_year_end=FISCAL_YEAR_END,
+                )
+        except (KeyError, TypeError, ValueError) as error:
+            candidate_results.append(
+                {
+                    "concept_id": concept_id,
+                    "coverage_years": 0,
+                    "result": str(error),
+                }
+            )
+            continue
+
+        coverage_years = candidate_frame[
+            "fiscal_year"
+        ].nunique()
+        candidate_results.append(
+            {
+                "concept_id": concept_id,
+                "coverage_years": int(coverage_years),
+                "result": "usable",
+            }
+        )
+
+        if coverage_years > best_coverage:
+            best_frame = candidate_frame
+            best_concept = concept_id
+            best_coverage = int(coverage_years)
+
+        if coverage_years == target_year_count:
+            break
+
+    status = "missing"
+    if best_coverage == target_year_count:
+        status = "complete"
+    elif best_coverage > 0:
+        status = "partial"
+
+    diagnostic = {
+        "metric_name": metric_name,
+        "selected_concept": best_concept,
+        "coverage_years": best_coverage,
+        "status": status,
+        "candidate_results": candidate_results,
+    }
+
+    return best_frame, diagnostic
+
+
+def merge_metric_frame(left_df, right_df, metric_name):
+    if right_df["fiscal_year"].duplicated().any():
+        raise ValueError(
+            f"{metric_name} frame에 fiscal_year 중복이 있습니다."
+        )
+
+    return left_df.merge(
         right_df,
         on="fiscal_year",
-        how="outer",
+        how="left",
         validate="one_to_one",
-        indicator=True,
     )
 
-    if not merged_df["_merge"].eq("both").all():
-        unmatched_df = merged_df.loc[
-            merged_df["_merge"].ne("both"),
-            ["fiscal_year", "_merge"],
-        ]
+
+def coalesce_columns(dataframe, columns):
+    existing_columns = [
+        column
+        for column in columns
+        if column in dataframe.columns
+    ]
+
+    if not existing_columns:
+        return pd.Series(pd.NaT, index=dataframe.index)
+
+    return dataframe[existing_columns].bfill(axis=1).iloc[:, 0]
+
+
+def row_dates_match(row, columns):
+    values = [
+        row[column]
+        for column in columns
+        if column in row.index and pd.notna(row[column])
+    ]
+
+    if len(values) <= 1:
+        return pd.NA
+
+    return all(value == values[0] for value in values[1:])
+
+
+def nullable_date_match(left_value, right_value):
+    if pd.isna(left_value) or pd.isna(right_value):
+        return pd.NA
+
+    return left_value == right_value
+
+
+def build_company_financials(
+    companyfacts_json,
+    ticker,
+    company_config,
+):
+    company_cik = f"{company_config['cik_int']:010d}"
+    payload_cik = int(companyfacts_json.get("cik", -1))
+
+    if payload_cik != company_config["cik_int"]:
         raise ValueError(
-            f"{metric_name} 병합에서 회계 범위가 "
-            f"일치하지 않습니다: {unmatched_df.to_dict('records')}"
+            f"{ticker} companyfacts의 CIK가 설정값과 다릅니다."
         )
 
-    return merged_df.drop(columns="_merge")
-
-
-def extract_metric_frames(companyfacts_json):
-    metric_frames = {}
-
-    for metric_name, config in METRIC_CONFIGS.items():
-        if config["fact_type"] == "duration":
-            metric_frames[metric_name] = (
-                extract_annual_duration_facts(
-                    companyfacts_json=companyfacts_json,
-                    concept_id=config["concept_id"],
-                    metric_name=metric_name,
-                    fiscal_year_start=FISCAL_YEAR_START,
-                    fiscal_year_end=FISCAL_YEAR_END,
-                )
-            )
-        elif config["fact_type"] == "instant":
-            metric_frames[metric_name] = (
-                extract_annual_instant_facts(
-                    companyfacts_json=companyfacts_json,
-                    concept_id=config["concept_id"],
-                    metric_name=metric_name,
-                    fiscal_year_start=FISCAL_YEAR_START,
-                    fiscal_year_end=FISCAL_YEAR_END,
-                )
-            )
-        else:
-            raise ValueError(
-                f"지원하지 않는 fact_type입니다: "
-                f"{config['fact_type']}"
-            )
-
-    return metric_frames
-
-
-def validate_metric_dates(merged_df):
-    common_period_start = merged_df["revenue_period_start"]
-    common_period_end = merged_df["common_period_end"]
-
-    for metric_name in [
-        "net_income",
-        "operating_cash_flow",
-    ]:
-        start_column = f"{metric_name}_period_start"
-        end_column = f"{metric_name}_period_end"
-
-        if not common_period_start.eq(
-            merged_df[start_column]
-        ).all():
-            raise ValueError(
-                f"revenue와 {metric_name}의 시작일이 "
-                "일치하지 않습니다."
-            )
-
-        if not common_period_end.eq(
-            merged_df[end_column]
-        ).all():
-            raise ValueError(
-                f"revenue와 {metric_name}의 종료일이 "
-                "일치하지 않습니다."
-            )
-
-    assets_date = merged_df["assets_balance_sheet_date"]
-    liabilities_date = (
-        merged_df["liabilities_balance_sheet_date"]
+    fiscal_years = list(
+        range(FISCAL_YEAR_START, FISCAL_YEAR_END + 1)
     )
+    merged_df = pd.DataFrame(
+        {"fiscal_year": fiscal_years}
+    )
+    diagnostics = []
 
-    if not assets_date.eq(liabilities_date).all():
-        raise ValueError(
-            "assets와 liabilities의 balance sheet date가 "
-            "일치하지 않습니다."
+    for metric_name in METRIC_NAMES:
+        metric_frame, diagnostic = resolve_metric_frame(
+            companyfacts_json=companyfacts_json,
+            company_config=company_config,
+            metric_name=metric_name,
         )
-
-    if not common_period_start.eq(assets_date).all():
-        raise ValueError(
-            "duration fact의 period end와 instant fact의 "
-            "balance sheet date가 일치하지 않습니다."
-        )
-
-
-def build_apple_financials_extended(companyfacts_json):
-    metric_frames = extract_metric_frames(companyfacts_json)
-
-    merged_df = metric_frames["revenue"].copy()
-
-    for metric_name in [
-        "net_income",
-        "assets",
-        "liabilities",
-        "operating_cash_flow",
-    ]:
+        diagnostics.append(diagnostic)
         merged_df = merge_metric_frame(
             left_df=merged_df,
-            right_df=metric_frames[metric_name],
+            right_df=metric_frame,
             metric_name=metric_name,
         )
 
-    validate_metric_dates(merged_df)
+    duration_start_columns = [
+        f"{metric_name}_period_start"
+        for metric_name in DURATION_METRIC_NAMES
+    ]
+    duration_end_columns = [
+        f"{metric_name}_period_end"
+        for metric_name in DURATION_METRIC_NAMES
+    ]
+    instant_date_columns = [
+        f"{metric_name}_balance_sheet_date"
+        for metric_name in INSTANT_METRIC_NAMES
+    ]
 
-    apple_financials_extended_df = merged_df.copy()
-    apple_financials_extended_df["company"] = (
-        companyfacts_json["entityName"]
+    merged_df["period_start"] = coalesce_columns(
+        dataframe=merged_df,
+        columns=duration_start_columns,
     )
-    apple_financials_extended_df["ticker"] = APPLE_TICKER
-    apple_financials_extended_df["cik"] = APPLE_CIK
-    apple_financials_extended_df["period_start"] = (
-        apple_financials_extended_df[
-            "revenue_period_start"
-        ]
+    merged_df["period_end"] = coalesce_columns(
+        dataframe=merged_df,
+        columns=duration_end_columns,
     )
-    apple_financials_extended_df["period_end"] = (
-        apple_financials_extended_df[
-            "revenue_period_end"
-        ]
-    )
-    apple_financials_extended_df["balance_sheet_date"] = (
-        apple_financials_extended_df[
-            "assets_balance_sheet_date"
-        ]
-    )
-    apple_financials_extended_df["form"] = "10-K"
-    apple_financials_extended_df["unit"] = "USD"
-    apple_financials_extended_df["source"] = (
-        "SEC EDGAR companyfacts"
+    merged_df["balance_sheet_date"] = coalesce_columns(
+        dataframe=merged_df,
+        columns=instant_date_columns,
     )
 
-    date_columns_to_drop = []
+    merged_df["duration_dates_match"] = merged_df.apply(
+        lambda row: (
+            row_dates_match(row, duration_start_columns)
+            and row_dates_match(row, duration_end_columns)
+            if pd.notna(
+                row_dates_match(row, duration_start_columns)
+            )
+            and pd.notna(
+                row_dates_match(row, duration_end_columns)
+            )
+            else pd.NA
+        ),
+        axis=1,
+    ).astype("boolean")
+    merged_df["instant_dates_match"] = merged_df.apply(
+        lambda row: row_dates_match(
+            row,
+            instant_date_columns,
+        ),
+        axis=1,
+    ).astype("boolean")
+    merged_df[
+        "period_end_matches_balance_sheet_date"
+    ] = merged_df.apply(
+        lambda row: nullable_date_match(
+            row["period_end"],
+            row["balance_sheet_date"],
+        ),
+        axis=1,
+    ).astype("boolean")
 
-    for metric_name in DURATION_METRIC_NAMES:
-        date_columns_to_drop.extend(
-            [
-                f"{metric_name}_period_start",
-                f"{metric_name}_period_end",
-            ]
-        )
+    merged_df["metric_coverage_count"] = merged_df[
+        METRIC_VALUE_COLUMNS
+    ].notna().sum(axis=1)
+    merged_df["missing_metrics"] = merged_df.apply(
+        lambda row: ", ".join(
+            metric_name
+            for metric_name in METRIC_NAMES
+            if pd.isna(row[f"{metric_name}_usd"])
+        ),
+        axis=1,
+    )
 
-    for metric_name in INSTANT_METRIC_NAMES:
-        date_columns_to_drop.append(
-            f"{metric_name}_balance_sheet_date"
-        )
+    merged_df["company_name"] = company_config["company_name"]
+    merged_df["ticker"] = ticker
+    merged_df["cik"] = company_cik
+    merged_df["sector"] = company_config["sector"]
+    merged_df["form"] = "10-K"
+    merged_df["unit"] = "USD"
+    merged_df["source"] = "SEC EDGAR companyfacts"
 
-    apple_financials_extended_df = (
-        apple_financials_extended_df
-        .drop(columns=date_columns_to_drop)
-        [FINAL_COLUMNS]
+    date_columns_to_drop = (
+        duration_start_columns
+        + duration_end_columns
+        + instant_date_columns
+    )
+    merged_df = merged_df.drop(
+        columns=date_columns_to_drop,
+    )
+
+    company_financials_df = (
+        merged_df[FINAL_COLUMNS]
         .sort_values("fiscal_year")
         .reset_index(drop=True)
     )
 
-    return apple_financials_extended_df
+    return company_financials_df, diagnostics
 
 
-def validate_apple_financials_extended(financials_df):
+def validate_company_financials(
+    company_financials_df,
+    ticker,
+    company_config,
+):
     expected_fiscal_years = set(
         range(FISCAL_YEAR_START, FISCAL_YEAR_END + 1)
     )
     actual_fiscal_years = set(
-        financials_df["fiscal_year"].tolist()
+        company_financials_df["fiscal_year"].tolist()
     )
+    expected_cik = f"{company_config['cik_int']:010d}"
 
-    if list(financials_df.columns) != FINAL_COLUMNS:
-        raise ValueError(("최종 column 순서가 기준과 다릅니다."))
+    if list(company_financials_df.columns) != FINAL_COLUMNS:
+        raise ValueError(
+            f"{ticker}의 최종 column 순서가 기준과 다릅니다."
+        )
 
     if actual_fiscal_years != expected_fiscal_years:
         raise ValueError(
-            "회계연도 범위가 2021~2025와 일치하지 않습니다."
+            f"{ticker}의 회계연도 범위가 2021~2025와 "
+            "일치하지 않습니다."
         )
 
-    if financials_df["fiscal_year"].duplicated().any():
-        raise ValueError("fiscal_year 중복이 있습니다.")
-
-    if financials_df[METRIC_VALUE_COLUMNS].isna().any().any():
-        raise ValueError("다섯 재무지표에 결측치가 있습니다.")
-
-    if not financials_df[METRIC_VALUE_COLUMNS].gt(0).all().all():
-        raise ValueError("Apple 기준 지표 값에 0 이하가 있습니다.")
-
-    if not financials_df["cik"].eq(APPLE_CIK).all():
-        raise ValueError("CIK가 10자리 Apple CIK와 다릅니다.")
-
-    if not financials_df["form"].eq("10-K").all():
-        raise ValueError("form이 모두 10-K가 아닙니다.")
-
-    if not financials_df["unit"].eq("USD").all():
-        raise ValueError("unit이 모두 USD가 아닙니다.")
-
-    if not financials_df["period_end"].eq(
-        financials_df["balance_sheet_date"]
-    ).all():
+    if company_financials_df["fiscal_year"].duplicated().any():
         raise ValueError(
-            "period_end와 balance_sheet_date가 일치하지 않습니다."
+            f"{ticker}의 fiscal_year 중복이 있습니다."
         )
 
-    if not financials_df["fiscal_year"].eq(
-        financials_df["period_end"].dt.year
-    ).all():
-        raise ValueError("fiscal_year와 period_end의 연도가 다릅니다.")
+    if not company_financials_df["ticker"].eq(ticker).all():
+        raise ValueError(f"{ticker} ticker 값이 섞여 있습니다.")
 
-    duration_columns = [
-        f"{metric_name}_duration_days"
-        for metric_name in DURATION_METRIC_NAMES
+    if not company_financials_df["cik"].eq(expected_cik).all():
+        raise ValueError(
+            f"{ticker} CIK가 10자리 설정값과 다릅니다."
+        )
+
+    if company_financials_df[
+        "metric_coverage_count"
+    ].lt(3).any():
+        raise ValueError(
+            f"{ticker}의 일부 회계연도에서 수집된 지표가 "
+            "3개보다 적습니다."
+        )
+
+    positive_when_present = [
+        "revenue_usd",
+        "assets_usd",
+        "liabilities_usd",
     ]
-    
-    if not financials_df[duration_columns].apply(
-        lambda column: column.between(330, 400)
-    ).all().all():
-        raise ValueError(
-            "duration factㅇ의 기간 길이가 330~400일 범위를 "
-            "벗어났습니다."
-        )
 
-    expected_concepts = {
-        f"{metric_name}_concept": config["config_id"]
-        for metric_name, config in METRIC_CONFIGS.items()
-    }
-
-    for column, expected_concept in expected_concepts.items():
-        if not financials_df[column].eq(
-            expected_concept
-        ).all():
+    for column in positive_when_present:
+        values = company_financials_df[column].dropna()
+        if not values.gt(0).all():
             raise ValueError(
-                f"{column}이 예상 concept과 다릅니다."
+                f"{ticker}의 {column}에 0 이하 값이 있습니다."
             )
 
-    source_columns = [
-        column
-        for column in financials_df.columns
-        if column.endswith("_filed")
-        or column.endswith("_accn")
-    ]
+    for metric_name in METRIC_NAMES:
+        value_column = f"{metric_name}_usd"
+        concept_column = f"{metric_name}_concept"
+        filed_column = f"{metric_name}_filed"
+        accn_column = f"{metric_name}_accn"
+        present_mask = company_financials_df[
+            value_column
+        ].notna()
 
-    if financials_df[source_columns].isna().any().any():
-        raise ValueError("filed 또는 accn에 결측치가 있습니다.")
+        if company_financials_df.loc[
+            present_mask,
+            [concept_column, filed_column, accn_column],
+        ].isna().any().any():
+            raise ValueError(
+                f"{ticker}의 {metric_name} 출처 추적 column에 "
+                "결측치가 있습니다."
+            )
 
-    return {
-        "shape": financials_df.shape,
-        "fiscal_year": sorted(actual_fiscal_years),
-        "duplicate_fiscal_year_count": int(
-            financials_df["fiscal_year"].duplicated().sum()
-        ),
-        "missing_metric_value_count": int(
-            financials_df[METRIC_VALUE_COLUMNS]
-            .isna()
-            .sum()
-            .sum()
-        ),
-    }
+    for flag_column in QUALITY_FLAG_COLUMNS:
+        if company_financials_df[flag_column].eq(False).any():
+            raise ValueError(
+                f"{ticker}의 {flag_column} 검수가 실패했습니다."
+            )
 
 
-def save_and_reload_financials(financials_df):
-    if not CSV_OUTPUT_PATH.parent.is_dir():
-        raise FileNotFoundError(
-            "data 폴더가 없습니다: "
-            f"{CSV_OUTPUT_PATH.parent}"
+def collect_all_company_financials(headers):
+    company_frames = []
+    diagnostic_rows = []
+
+    for ticker, company_config in COMPANY_CONFIGS.items():
+        cik = f"{company_config['cik_int']:010d}"
+        companyfacts_url = (
+            SEC_COMPANYFACTS_URL_TEMPLATE.format(cik=cik)
         )
+        companyfacts_json = get_sec_json(
+            url=companyfacts_url,
+            headers=headers,
+        )
+        company_financials_df, diagnostics = (
+            build_company_financials(
+                companyfacts_json=companyfacts_json,
+                ticker=ticker,
+                company_config=company_config,
+            )
+        )
+        validate_company_financials(
+            company_financials_df=company_financials_df,
+            ticker=ticker,
+            company_config=company_config,
+        )
+        company_frames.append(company_financials_df)
 
-    financials_df.to_csv(
-        CSV_OUTPUT_PATH,
-        index=False,
-        date_format="%Y-%m-%d",
+        for diagnostic in diagnostics:
+            diagnostic_rows.append(
+                {
+                    "ticker": ticker,
+                    "metric_name": diagnostic["metric_name"],
+                    "selected_concept": diagnostic[
+                        "selected_concept"
+                    ],
+                    "coverage_years": diagnostic[
+                        "coverage_years"
+                    ],
+                    "status": diagnostic["status"],
+                }
+            )
+
+    combined_df = (
+        pd.concat(company_frames, ignore_index=True)
+        .sort_values(["ticker", "fiscal_year"])
+        .reset_index(drop=True)
+    )
+    diagnostics_df = pd.DataFrame(diagnostic_rows)
+
+    return combined_df, diagnostics_df
+
+
+def validate_combined_financials(combined_df):
+    expected_tickers = set(COMPANY_CONFIGS)
+    actual_tickers = set(combined_df["ticker"].unique())
+    expected_row_count = len(COMPANY_CONFIGS) * (
+        FISCAL_YEAR_END - FISCAL_YEAR_START + 1
     )
 
+    if list(combined_df.columns) != FINAL_COLUMNS:
+        raise ValueError("통합 CSV의 column 순서가 다릅니다.")
+
+    if actual_tickers != expected_tickers:
+        raise ValueError("통합 데이터의 ticker 구성이 다릅니다.")
+
+    if len(combined_df) != expected_row_count:
+        raise ValueError(
+            f"통합 데이터가 {expected_row_count}행이 아닙니다."
+        )
+
+    if combined_df.duplicated(
+        subset=["ticker", "fiscal_year"]
+    ).any():
+        raise ValueError("ticker·fiscal_year 중복이 있습니다.")
+
+    if not combined_df["cik"].str.fullmatch(r"\d{10}").all():
+        raise ValueError("10자리 문자열이 아닌 CIK가 있습니다.")
+
+    rows_per_ticker = combined_df.groupby(
+        "ticker"
+    )["fiscal_year"].nunique()
+    expected_year_count = (
+        FISCAL_YEAR_END - FISCAL_YEAR_START + 1
+    )
+
+    if not rows_per_ticker.eq(expected_year_count).all():
+        raise ValueError(
+            "기업별 회계연도 개수가 5개로 맞지 않습니다."
+        )
+
+    if combined_df["metric_coverage_count"].lt(3).any():
+        raise ValueError(
+            "수집 지표가 3개보다 적은 기업·회계연도가 있습니다."
+        )
+
+
+def normalize_nullable_boolean_series(series):
+    def normalize_value(value):
+        if pd.isna(value) or str(value).strip() == "":
+            return pd.NA
+
+        normalized = str(value).strip().lower()
+        if normalized == "true":
+            return True
+        if normalized == "false":
+            return False
+
+        raise ValueError(
+            f"boolean으로 바꿀 수 없는 값입니다: {value}"
+        )
+
+    return series.map(normalize_value).astype("boolean")
+
+
+def reload_company_financials(csv_path):
     reloaded_df = pd.read_csv(
-        CSV_OUTPUT_PATH,
-        dtype={"cik": "string"},
+        csv_path,
+        dtype={
+            "ticker": "string",
+            "cik": "string",
+            "revenue_accn": "string",
+            "net_income_accn": "string",
+            "assets_accn": "string",
+            "liabilities_accn": "string",
+            "operating_cash_flow_accn": "string",
+        },
         parse_dates=DATE_COLUMNS,
     )
 
-    validate_apple_financials_extended(reloaded_df)
+    for flag_column in QUALITY_FLAG_COLUMNS:
+        reloaded_df[flag_column] = (
+            normalize_nullable_boolean_series(
+                reloaded_df[flag_column]
+            )
+        )
 
     return reloaded_df
 
 
-def build_billion_display(financials_df):
-    display_df = financials_df[
-        ["fiscal_year", *METRIC_VALUE_COLUMNS]
-    ].copy()
-
-    for column in METRIC_VALUE_COLUMNS:
-        display_df[column] = (
-            display_df[column]
-            / 1_000_000_000
-        ).round(3)
-
-    display_df = display_df.rename(
-        columns={
-            column: column.replace("_usd", "_usd_bn")
-            for column in METRIC_VALUE_COLUMNS
-        }
+def save_company_financials(combined_df, csv_path):
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    combined_df.to_csv(
+        csv_path,
+        index=False,
+        date_format="%Y-%m-%d",
     )
-
-    return display_df
 
 
 def main():
-    sec_contact_email = getpass(
-        "SEC User-Agent에 넣을 연락처 이메일을 입력하세요: "
+    contact_email = getpass(
+        "SEC User-Agent에 사용할 연락 가능한 이메일: "
     )
-    sec_headers = build_sec_headers(sec_contact_email)
+    headers = build_sec_headers(contact_email)
 
-    companyfacts_url = SEC_COMPANYFACTS_URL_TEMPLATE.format(
-        ck=APPLE_CIK
+    combined_df, diagnostics_df = (
+        collect_all_company_financials(headers=headers)
     )
-    apple_companyfacts_json = get_sec_json(
-        url=companyfacts_url,
-        headers=sec_headers,
-    )
-
-    if int(apple_companyfacts_json.get("cik", -1)) != APPLE_CIK_INT:
-        raise ValueError("companyfacts CIK가 Apple CIK와 다릅니다.")
-
-    if "facts" not in apple_companyfacts_json:
-        raise KeyError("companyfacts에서 facts를 찾지 못했습니다.")
-
-    apple_financials_extended_df = (
-        build_apple_financials_extended(
-            apple_companyfacts_json
-        )
-    )
-    validation_summary = validate_apple_financials_extended(
-        apple_financials_extended_df
-    )
-    reloaded_financials_extended_df = save_and_reload_financials(
-        apple_financials_extended_df
-    )
-    display_df = build_billion_display(
-        reloaded_financials_extended_df
+    validate_combined_financials(combined_df)
+    save_company_financials(
+        combined_df=combined_df,
+        csv_path=CSV_OUTPUT_PATH,
     )
 
+    reloaded_df = reload_company_financials(
+        csv_path=CSV_OUTPUT_PATH,
+    )
+    validate_combined_financials(reloaded_df)
+
+    print("\n선택된 concept과 회계연도 coverage")
+    print(diagnostics_df.to_string(index=False))
+    print("\n기업별 row 수")
     print(
-        "company_name:",
-        apple_companyfacts_json.get("entityName"),
+        reloaded_df.groupby("ticker").size().to_string()
     )
-    print("output_path:", CSV_OUTPUT_PATH)
-    print("extended_shape:", validation_summary["shape"])
+    print("\n기업별·지표별 결측치 수")
     print(
-        "fiscal_years:",
-        validation_summary["fiscal_year"],
+        reloaded_df.groupby("ticker")[
+            METRIC_VALUE_COLUMNS
+        ].apply(lambda frame: frame.isna().sum())
     )
-    print(
-        "duplicate_fiscal_year_count:",
-        validation_summary["duplicate_fiscal_year_count"],
-    )
-    print(
-        "missing_metric_value_count:",
-        validation_summary["missing_metric_value_count"],
-    )
-    print(display_df.to_string(index=False))
+    print("\n저장 결과")
+    print(f"shape: {reloaded_df.shape}")
+    print(f"saved: {CSV_OUTPUT_PATH}")
 
 
 if __name__ == "__main__":
