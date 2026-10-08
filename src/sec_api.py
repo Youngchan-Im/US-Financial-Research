@@ -1,23 +1,39 @@
+import argparse
 from getpass import getpass
+import json
+import os
 from pathlib import Path
 import time
 
 import pandas as pd
 import requests
+from dotenv import load_dotenv
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+ENV_PATH = PROJECT_ROOT / ".env"
 CSV_OUTPUT_PATH = (
     PROJECT_ROOT
     / "data"
-    / "us_finance_company_financials.csv"
+    / "company_financials.csv"
 )
+CACHE_DIR = PROJECT_ROOT / "data" / "cache"
 
 SEC_COMPANYFACTS_URL_TEMPLATE = (
     "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
 )
 REQUEST_TIMEOUT_SECONDS = 30
 REQUEST_INTERVAL_SECONDS = 0.2
+CACHE_MAX_AGE_HOURS = 24
+MAX_RETRIES = 4
+BACKOFF_BASE_SECONDS = 1.0
+RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
+
+
+class TransientRequestError(RuntimeError):
+    """재시도 뒤에도 끝나지 않은 일시적 요청 오류다."""
+
+
 
 FISCAL_YEAR_START = 2021
 FISCAL_YEAR_END = 2025
@@ -188,29 +204,172 @@ def build_sec_headers(contact_email):
     }
 
 
-def get_sec_json(
-    url,
-    headers,
-    pause_seconds=REQUEST_INTERVAL_SECONDS,
-):
-    if pause_seconds < 0:
-        raise ValueError("pause_seconds는 0 이상이어야 합니다.")
+def cache_age_hours(cache_path):
+    if not cache_path.exists():
+        return None
 
-    time.sleep(pause_seconds)
+    age_seconds = time.time() - cache_path.stat().st_mtime
+    return age_seconds / 3600
 
-    response = requests.get(
-        url,
-        headers=headers,
-        timeout=REQUEST_TIMEOUT_SECONDS,
-    )
-    response.raise_for_status()
 
-    payload = response.json()
+def load_json_cache(cache_path, max_age_hours=None):
+    if not cache_path.exists():
+        return None
+
+    if max_age_hours is not None:
+        age_hours = cache_age_hours(cache_path)
+        if age_hours is None or age_hours > max_age_hours:
+            return None
+
+    try:
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(
+            f"캐시 JSON을 읽지 못했습니다: {cache_path}"
+        ) from error
 
     if not isinstance(payload, dict):
-        raise TypeError("SEC JSON 최상위 구조가 딕셔너리가 아닙니다.")
+        raise TypeError(
+            f"캐시 JSON 최상위 구조가 딕셔너리가 아닙니다: "
+            f"{cache_path}"
+        )
 
     return payload
+
+
+def write_json_cache(cache_path, payload):
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = cache_path.with_suffix(".json.tmp")
+
+    temporary_path.write_text(
+        json.dumps(payload, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    temporary_path.replace(cache_path)
+
+
+def retry_wait_seconds(response, attempt):
+    retry_after = response.headers.get("Retry-After")
+
+    if retry_after:
+        try:
+            return max(float(retry_after), 0.0)
+        except ValueError:
+            pass
+
+    return BACKOFF_BASE_SECONDS * (2 ** (attempt - 1))
+
+
+def request_sec_json(session, url, headers):
+    last_error = None
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        time.sleep(REQUEST_INTERVAL_SECONDS)
+
+        try:
+            response = session.get(
+                url,
+                headers=headers,
+                timeout=REQUEST_TIMEOUT_SECONDS,
+            )
+
+            if response.status_code in RETRY_STATUS_CODES:
+                if attempt == MAX_RETRIES:
+                    raise TransientRequestError(
+                        "SEC request가 일시적 HTTP 오류 상태로 "
+                        f"종료되었습니다: {response.status_code}"
+                    )
+
+                wait_seconds = retry_wait_seconds(
+                    response=response,
+                    attempt=attempt,
+                )
+                print(
+                    "sec_retry:",
+                    f"attempt={attempt}",
+                    f"status={response.status_code}",
+                    f"wait_seconds={wait_seconds}",
+                )
+                time.sleep(wait_seconds)
+                continue
+
+            response.raise_for_status()
+            payload = response.json()
+
+            if not isinstance(payload, dict):
+                raise TypeError(
+                    "SEC JSON 최상위 구조가 딕셔너리가 아닙니다."
+                )
+
+            return payload
+
+        except (requests.Timeout, requests.ConnectionError) as error:
+            last_error = error
+            if attempt == MAX_RETRIES:
+                break
+
+            wait_seconds = BACKOFF_BASE_SECONDS * (
+                2 ** (attempt - 1)
+            )
+            print(
+                "sec_retry:",
+                f"attempt={attempt}",
+                "status=network_error",
+                f"wait_seconds={wait_seconds}",
+            )
+            time.sleep(wait_seconds)
+
+        except requests.RequestException:
+            raise
+        except ValueError as error:
+            raise ValueError(
+                "SEC response를 JSON으로 변환하지 못했습니다."
+            ) from error
+
+    raise TransientRequestError(
+        "SEC request가 재시도 횟수를 초과했습니다."
+    ) from last_error
+
+
+def get_sec_json(
+    session,
+    url,
+    headers,
+    cache_path,
+    refresh_cache=False,
+):
+    if not refresh_cache:
+        cached_payload = load_json_cache(
+            cache_path=cache_path,
+            max_age_hours=CACHE_MAX_AGE_HOURS,
+        )
+        if cached_payload is not None:
+            return cached_payload, "fresh_cache"
+
+    try:
+        payload = request_sec_json(
+            session=session,
+            url=url,
+            headers=headers,
+        )
+        write_json_cache(
+            cache_path=cache_path,
+            payload=payload,
+        )
+        return payload, "network"
+    except TransientRequestError as error:
+        stale_payload = load_json_cache(
+            cache_path=cache_path,
+            max_age_hours=None,
+        )
+        if stale_payload is not None:
+            print(
+                "sec_cache_fallback:",
+                cache_path.name,
+                type(error).__name__,
+            )
+            return stale_payload, "stale_cache"
+        raise
 
 
 def concept_usd_facts_to_df(
@@ -276,6 +435,13 @@ def concept_usd_facts_to_df(
         facts_df["val"],
         errors="coerce",
     )
+    facts_df["reported_fy"] = pd.to_numeric(
+        facts_df["fy"],
+        errors="coerce",
+    ).astype("Int64")
+    facts_df["end_year"] = facts_df["end"].dt.year.astype(
+        "Int64"
+    )
     facts_df["duration_days"] = (
         facts_df["end"]
         - facts_df["start"]
@@ -284,6 +450,24 @@ def concept_usd_facts_to_df(
     facts_df["unit"] = "USD"
 
     return facts_df
+
+
+def report_fiscal_year_context(annual_df, concept_id):
+    comparable = annual_df.dropna(
+        subset=["reported_fy", "fiscal_year"]
+    )
+    mismatch_count = comparable.loc[
+        comparable["reported_fy"].ne(
+            comparable["fiscal_year"]
+        )
+    ].shape[0]
+
+    print(
+        "fiscal_year_context:",
+        concept_id,
+        f"candidate_rows={len(annual_df)}",
+        f"reported_fy_mismatch_count={mismatch_count}",
+    )
 
 
 def select_latest_record_per_fiscal_year(facts_df):
@@ -337,6 +521,10 @@ def extract_annual_duration_facts(
             "찾지 못했습니다."
         )
 
+    report_fiscal_year_context(
+        annual_df=annual_df,
+        concept_id=concept_id,
+    )
     annual_df = select_latest_record_per_fiscal_year(
         annual_df
     )
@@ -404,6 +592,10 @@ def extract_annual_instant_facts(
             "찾지 못했습니다."
         )
 
+    report_fiscal_year_context(
+        annual_df=annual_df,
+        concept_id=concept_id,
+    )
     annual_df = select_latest_record_per_fiscal_year(
         annual_df
     )
@@ -816,7 +1008,11 @@ def validate_company_financials(
             )
 
 
-def collect_all_company_financials(headers):
+def collect_all_company_financials(
+    headers,
+    session,
+    refresh_cache=False,
+):
     company_frames = []
     diagnostic_rows = []
 
@@ -825,9 +1021,35 @@ def collect_all_company_financials(headers):
         companyfacts_url = (
             SEC_COMPANYFACTS_URL_TEMPLATE.format(cik=cik)
         )
-        companyfacts_json = get_sec_json(
-            url=companyfacts_url,
-            headers=headers,
+        cache_path = (
+            CACHE_DIR
+            / f"sec_companyfacts_{cik}.json"
+        )
+
+        try:
+            companyfacts_json, cache_status = get_sec_json(
+                session=session,
+                url=companyfacts_url,
+                headers=headers,
+                cache_path=cache_path,
+                refresh_cache=refresh_cache,
+            )
+        except (
+            requests.RequestException,
+            RuntimeError,
+            ValueError,
+            TypeError,
+            OSError,
+        ) as error:
+            raise RuntimeError(
+                f"{ticker} companyfacts 수집에 실패했습니다."
+            ) from error
+
+        print(
+            "sec_payload_source:",
+            ticker,
+            cache_status,
+            cache_path.name,
         )
         company_financials_df, diagnostics = (
             build_company_financials(
@@ -855,6 +1077,7 @@ def collect_all_company_financials(headers):
                         "coverage_years"
                     ],
                     "status": diagnostic["status"],
+                    "cache_status": cache_status,
                 }
             )
 
@@ -957,32 +1180,82 @@ def reload_company_financials(csv_path):
 
 def save_company_financials(combined_df, csv_path):
     csv_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = csv_path.with_suffix(".csv.tmp")
+
     combined_df.to_csv(
-        csv_path,
+        temporary_path,
         index=False,
         date_format="%Y-%m-%d",
     )
+    temporary_path.replace(csv_path)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description=(
+            "SEC companyfacts를 수집해 다섯 기업 재무 CSV를 "
+            "재생성합니다."
+        )
+    )
+    parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="유효한 캐시가 있어도 SEC API를 다시 요청합니다.",
+    )
+    return parser.parse_args()
+
+
+def load_sec_contact_email(env_path):
+    load_dotenv(dotenv_path=env_path)
+    contact_email = os.getenv("SEC_CONTACT_EMAIL", "").strip()
+
+    if not contact_email:
+        contact_email = getpass(
+            "SEC User-Agent에 사용할 연락 가능한 이메일: "
+        ).strip()
+
+    return contact_email
 
 
 def main():
-    contact_email = getpass(
-        "SEC User-Agent에 사용할 연락 가능한 이메일: "
-    )
-    headers = build_sec_headers(contact_email)
+    args = parse_args()
 
-    combined_df, diagnostics_df = (
-        collect_all_company_financials(headers=headers)
-    )
-    validate_combined_financials(combined_df)
-    save_company_financials(
-        combined_df=combined_df,
-        csv_path=CSV_OUTPUT_PATH,
-    )
+    try:
+        contact_email = load_sec_contact_email(ENV_PATH)
+        headers = build_sec_headers(contact_email)
 
-    reloaded_df = reload_company_financials(
-        csv_path=CSV_OUTPUT_PATH,
-    )
-    validate_combined_financials(reloaded_df)
+        with requests.Session() as session:
+            combined_df, diagnostics_df = (
+                collect_all_company_financials(
+                    headers=headers,
+                    session=session,
+                    refresh_cache=args.refresh,
+                )
+            )
+
+        validate_combined_financials(combined_df)
+        save_company_financials(
+            combined_df=combined_df,
+            csv_path=CSV_OUTPUT_PATH,
+        )
+
+        reloaded_df = reload_company_financials(
+            csv_path=CSV_OUTPUT_PATH,
+        )
+        validate_combined_financials(reloaded_df)
+
+    except (
+        ValueError,
+        KeyError,
+        TypeError,
+        OSError,
+        RuntimeError,
+        requests.RequestException,
+    ) as error:
+        print("collection_complete:", False)
+        print("error_type:", type(error).__name__)
+        print("error_message:", str(error))
+        return 1
 
     print("\n선택된 concept과 회계연도 coverage")
     print(diagnostics_df.to_string(index=False))
@@ -999,7 +1272,9 @@ def main():
     print("\n저장 결과")
     print(f"shape: {reloaded_df.shape}")
     print(f"saved: {CSV_OUTPUT_PATH}")
+    print("collection_complete:", True)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
