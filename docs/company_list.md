@@ -1,21 +1,34 @@
-# U.S. Financial Research Project 기업 목록
+# Companies
 
-## 수집 대상
+The project uses five companies with different business models and fiscal calendars. These labels are project groupings, rather than a claim that their financial metrics are directly comparable.
 
-| ticker | company_name | CIK | 프로젝트 분류 | 회계연도 종료 기준 | revenue concept 우선순위 |
+| Ticker | Company | CIK | Project grouping | Fiscal year end | Why it is included |
 |---|---|---|---|---|---|
-| `AAPL` | Apple Inc. | `0000320193` | Technology | 9월 말 | `RevenueFromContractWithCustomerExcludingAssessedTax` -> `Revenues` |
-| `MSFT` | Microsoft Corporation | `000078019` | Technology | 6월 30일 | `RevenueFromContractWithCustomerExcludingAssessedTax` -> `Revenues` |
-| `JPM` | JPMorgan Chase & Co. | `000019617` | Banking | 12월 31일 | `Revenues` -> `RevenueFromContractWithCustomerExcludingAssessedTax` |
-| `TSLA` | Tesla, Inc. | `0001318605` | Automotive and Energy | 12월 31일 | `RevenueFromContractWithCustomerExcludingAssessedTax` -> `Revenues` |
-| `WMT` | Walmart Inc. | `0000104169` | Retail | 1월 31일 | `SalesRevenueNet` -> `Revenues` |
+| AAPL | Apple Inc. | `0000320193` | Technology | Late September | Product and service revenue in the same business |
+| MSFT | Microsoft Corporation | `0000789019` | Technology | June 30 | Software and cloud revenue |
+| JPM | JPMorgan Chase & Co. | `0000019617` | Banking | December 31 | A bank balance sheet and exposure to the rate environment |
+| TSLA | Tesla, Inc. | `0001318605` | Automotive and Energy | December 31 | A growth business spanning vehicles and energy |
+| WMT | Walmart Inc. | `0000104169` | Retail | January 31 | Retail performance alongside consumer conditions |
 
-## 공통 수집 지표
+Keep CIKs as ten-character strings, including leading zeros. Use the saved `period_start` and `period_end` fields for each row; the fiscal-year label alone is not a common calendar window across companies.
 
-| metric_name | 의미 | fact type | 기본 concept |
-|---|---|---|---|
-| `revenue` | 회계연도 수익 또는 매출 | duration | 기업별 후보에서 선택
-| `net_income` | 회계연도 순이익 | duration | `NetIncomeLoss` |
-| `assets` | 결산일 자산 총액 | instant | `Assets` |
-| `liabilities` | 결산일 부채 총액 | instant | `Liabilities` |
-| `operating_cash_flow` | 회계연도 영업활동 현금흐름 | duration | `NetCashProvidedByUsedInOperatingActivities` |
+## Revenue concepts
+
+The collector tries these US-GAAP concepts in order. The selected concept is retained in `revenue_concept`.
+
+| Companies | Fallback order |
+|---|---|
+| AAPL, MSFT, TSLA | `RevenueFromContractWithCustomerExcludingAssessedTax`, then `Revenues` |
+| JPM | `Revenues`, then `RevenueFromContractWithCustomerExcludingAssessedTax` |
+| WMT | `RevenueFromContractWithCustomerExcludingAssessedTax`, then `SalesRevenueNet`, then `Revenues` |
+
+## Other financial metrics
+
+| Metric | US-GAAP concept | Reporting period |
+|---|---|---|
+| Net income | `NetIncomeLoss` | Fiscal year |
+| Assets | `Assets` | Balance-sheet date |
+| Liabilities | `Liabilities` | Balance-sheet date |
+| Operating cash flow | `NetCashProvidedByUsedInOperatingActivities` | Fiscal year |
+
+Banking assets, liabilities and revenue have a different economic meaning from the same broad categories in a technology or retail company. Compare each company's history before making a cross-company ranking.

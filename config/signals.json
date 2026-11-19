@@ -1,0 +1,47 @@
+{
+  "data_version": "signals/v3.1",
+  "target": "target_jupiter_60",
+  "identifier": "numerai_ticker",
+  "label_lag": 2,
+  "label_horizon": 60,
+  "label_calendar": {
+    "status": "unresolved"
+  },
+  "cutoff_policy": {
+    "feature_date": "market_close_date",
+    "availability": "available_at <= prediction_cutoff",
+    "unknown_release_time": "next_exchange_session",
+    "timestamp_timezone": "UTC"
+  },
+  "submission": {
+    "minimum_tickers": 100,
+    "signal_column": "signal",
+    "lower_bound": 0,
+    "upper_bound": 1,
+    "bounds": "exclusive"
+  },
+  "macro_enabled": false,
+  "sources": [
+    {
+      "id": "numerai_signals",
+      "reference_url": "https://docs.numer.ai/numerai-signals/data",
+      "training_allowed": true,
+      "use": "supplied_training_data"
+    },
+    {
+      "id": "sec_companyfacts",
+      "reference_url": "https://www.sec.gov/search-filings/edgar-application-programming-interfaces",
+      "training_allowed": false,
+      "use": "descriptive_baseline",
+      "reason": "Reconstruct filing availability before building training features."
+    },
+    {
+      "id": "fred",
+      "reference_url": "https://fred.stlouisfed.org/legal/",
+      "training_allowed": false,
+      "use": "descriptive_baseline",
+      "reason": "Model use requires a permitted source decision."
+    }
+  ],
+  "target_definition_url": "https://docs.numer.ai/numerai-signals/signals-overview"
+}

@@ -1,12 +1,18 @@
 import argparse
 import json
+import logging
+import math
 import os
 from pathlib import Path
 import time
+import tempfile
 
 import pandas as pd
 import requests
 from dotenv import load_dotenv
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -87,13 +93,11 @@ RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
 
 
 class TransientRequestError(RuntimeError):
-    """재시도 뒤에도 끝나지 않은 일시적 요청 오류다."""
-
-
+    """A temporary request failure that persisted after retries."""
 
 
 def load_fred_api_key(env_path):
-    """U.S. Financial Research Project 전용 .env에서 key를 읽는다."""
+    """Load the FRED key from the project environment."""
     load_dotenv(dotenv_path=env_path, override=False)
     fred_api_key = os.getenv("FRED_API_KEY")
 
@@ -105,8 +109,8 @@ def load_fred_api_key(env_path):
 
     if fred_api_key in invalid_key_values:
         raise ValueError(
-            "FRED_API_KEY가 준비되지 않았습니다. "
-            "프로젝트 루트의 .env를 확인하세요."
+            "FRED_API_KEY is missing. "
+            "Set it in the project's .env file."
         )
 
     return fred_api_key
@@ -133,12 +137,12 @@ def load_json_cache(cache_path, max_age_hours=None):
         payload = json.loads(cache_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise ValueError(
-            f"캐시 JSON을 읽지 못했습니다: {cache_path}"
+            f"Cannot read cache JSON: {cache_path}"
         ) from error
 
     if not isinstance(payload, dict):
         raise TypeError(
-            f"캐시 JSON 최상위 구조가 딕셔너리가 아닙니다: "
+            f"Cache JSON must be an object: "
             f"{cache_path}"
         )
 
@@ -181,74 +185,46 @@ def retry_wait_seconds(response, attempt):
 
 
 def request_fred_json(session, request_params):
-    last_error = None
-
+    """Request FRED JSON without exposing the API key in error messages."""
     for attempt in range(1, MAX_RETRIES + 1):
         time.sleep(REQUEST_INTERVAL_SECONDS)
-
         try:
             response = session.get(
                 FRED_OBSERVATIONS_ENDPOINT,
                 params=request_params,
                 timeout=REQUEST_TIMEOUT_SECONDS,
             )
-
-            if response.status_code in RETRY_STATUS_CODES:
-                if attempt == MAX_RETRIES:
-                    raise TransientRequestError(
-                        "FRED request가 일시적 HTTP 오류 상태로 "
-                        f"종료되었습니다: {response.status_code}"
-                    )
-
-                wait_seconds = retry_wait_seconds(
-                    response=response,
-                    attempt=attempt,
-                )
-                print(
-                    "fred_retry:",
-                    f"attempt={attempt}",
-                    f"status={response.status_code}",
-                    f"wait_seconds={wait_seconds}",
-                )
-                time.sleep(wait_seconds)
-                continue
-
-            response.raise_for_status()
-            payload = response.json()
-
-            if not isinstance(payload, dict):
-                raise TypeError(
-                    "FRED JSON 최상위 구조가 딕셔너리가 아닙니다."
-                )
-
-            return payload
-
-        except (requests.Timeout, requests.ConnectionError) as error:
-            last_error = error
+        except (requests.Timeout, requests.ConnectionError):
             if attempt == MAX_RETRIES:
                 break
+            wait = BACKOFF_BASE_SECONDS * (2 ** (attempt - 1))
+            LOGGER.warning("FRED connection failed; retrying in %.1f seconds (%d/%d).", wait, attempt, MAX_RETRIES)
+            time.sleep(wait)
+            continue
 
-            wait_seconds = BACKOFF_BASE_SECONDS * (
-                2 ** (attempt - 1)
-            )
-            print(
-                "fred_retry:",
-                f"attempt={attempt}",
-                "status=network_error",
-                f"wait_seconds={wait_seconds}",
-            )
-            time.sleep(wait_seconds)
+        if response.status_code in RETRY_STATUS_CODES:
+            if attempt == MAX_RETRIES:
+                raise TransientRequestError(f"FRED request failed after retries (HTTP {response.status_code}).")
+            wait = retry_wait_seconds(response, attempt)
+            LOGGER.warning("FRED returned HTTP %d; retrying in %.1f seconds (%d/%d).", response.status_code, wait, attempt, MAX_RETRIES)
+            time.sleep(wait)
+            continue
 
-        except requests.RequestException:
-            raise
-        except ValueError as error:
-            raise ValueError(
-                "FRED response를 JSON으로 변환하지 못했습니다."
-            ) from error
+        try:
+            response.raise_for_status()
+        except requests.HTTPError:
+            raise requests.HTTPError(
+                f"FRED request returned HTTP {response.status_code}.", response=response
+            ) from None
+        try:
+            payload = response.json()
+        except ValueError:
+            raise ValueError("FRED returned invalid JSON.") from None
+        if not isinstance(payload, dict):
+            raise TypeError("FRED JSON must be an object.")
+        return payload
 
-    raise TransientRequestError(
-        "FRED request가 재시도 횟수를 초과했습니다."
-    ) from last_error
+    raise TransientRequestError("FRED request failed after all retry attempts.") from None
 
 
 def fetch_fred_series(
@@ -259,7 +235,7 @@ def fetch_fred_series(
     session,
     refresh_cache=False,
 ):
-    """FRED series 하나를 date와 series ID column으로 반환한다."""
+    """Return one FRED series with date and value columns."""
     request_params = {
         "series_id": series_id,
         "api_key": api_key,
@@ -268,14 +244,6 @@ def fetch_fred_series(
         "observation_end": observation_end,
         "sort_order": SORT_ORDER,
     }
-    safe_request_params = {
-        **request_params,
-        "api_key": "***",
-    }
-    safe_request_text = json.dumps(
-        safe_request_params,
-        sort_keys=True,
-    )
     cache_path = fred_cache_path(
         series_id=series_id,
         observation_start=observation_start,
@@ -299,12 +267,8 @@ def fetch_fred_series(
                 session=session,
                 request_params=request_params,
             )
-            write_json_cache(
-                cache_path=cache_path,
-                payload=payload,
-            )
             payload_source = "network"
-        except TransientRequestError as error:
+        except TransientRequestError:
             payload = load_json_cache(
                 cache_path=cache_path,
                 max_age_hours=None,
@@ -313,11 +277,7 @@ def fetch_fred_series(
                 raise
 
             payload_source = "stale_cache"
-            print(
-                "fred_cache_fallback:",
-                series_id,
-                type(error).__name__,
-            )
+            LOGGER.warning("Using stale FRED cache for %s after a temporary request failure.", series_id)
 
     observations = payload.get("observations", [])
 
@@ -327,10 +287,10 @@ def fetch_fred_series(
         )
         if error_message:
             raise ValueError(
-                f"{series_id} FRED error: {error_message}"
+                f"{series_id} FRED error: {str(error_message).replace(api_key, '***') if api_key else error_message}"
             )
         raise ValueError(
-            f"{series_id} observations 목록이 비어 있습니다."
+            f"{series_id} has no observations."
         )
 
     raw_series_df = pd.DataFrame(observations)
@@ -341,7 +301,7 @@ def fetch_fred_series(
 
     if missing_required_columns:
         raise KeyError(
-            f"{series_id} 필수 column이 없습니다: "
+            f"{series_id} is missing required columns: "
             f"{sorted(missing_required_columns)}"
         )
 
@@ -367,35 +327,31 @@ def fetch_fred_series(
 
     if date_missing_count != 0:
         raise ValueError(
-            f"{series_id}에 변환되지 않은 날짜가 있습니다: "
+            f"{series_id} contains invalid dates: "
             f"{date_missing_count}"
         )
 
     if duplicate_date_count != 0:
         raise ValueError(
-            f"{series_id}에 중복 날짜가 있습니다: "
+            f"{series_id} contains duplicate dates: "
             f"{duplicate_date_count}"
         )
 
     if series_df[series_id].notna().sum() == 0:
         raise ValueError(
-            f"{series_id}에 숫자로 변환된 관측값이 없습니다."
+            f"{series_id} has no numeric observations."
         )
 
-    print("request_series_id:", series_id)
-    print("safe_request_params:", safe_request_params)
-    print(
-        "actual_key_hidden_in_preview:",
-        api_key not in safe_request_text,
+    if not series_df[series_id].dropna().map(math.isfinite).all():
+        raise ValueError(f"{series_id} contains non-finite observations.")
+
+    if payload_source == "network":
+        write_json_cache(cache_path, payload)
+    LOGGER.debug(
+        "%s: %d observations, %d missing values, %s to %s (%s)",
+        series_id, len(series_df), value_missing_count,
+        series_df["date"].min().date(), series_df["date"].max().date(), payload_source,
     )
-    print("payload_source:", payload_source)
-    print("cache_file:", cache_path.name)
-    print("returned_row_count:", len(series_df))
-    print("value_missing_count:", value_missing_count)
-    print("first_date:", series_df["date"].min().date())
-    print("last_date:", series_df["date"].max().date())
-    print("date_is_monotonic:", series_df["date"].is_monotonic_increasing)
-    print("-" * 60)
 
     return series_df
 
@@ -408,9 +364,9 @@ def collect_fred_series(
     session,
     refresh_cache=False,
 ):
-    """series ID 목록을 반복해 DataFrame 딕셔너리를 만든다."""
+    """Collect a DataFrame for each requested series."""
     if len(series_ids) != len(set(series_ids)):
-        raise ValueError("SERIES_IDS에 중복된 series ID가 있습니다.")
+        raise ValueError("Series IDs must be unique.")
 
     series_frames = {}
 
@@ -433,14 +389,16 @@ def collect_fred_series(
             OSError,
         ) as error:
             raise RuntimeError(
-                f"{series_id} 수집에 실패했습니다."
+                f"{series_id} collection failed."
             ) from error
 
     return series_frames
 
 
 def merge_fred_series(series_frames, series_ids):
-    """series별 DataFrame을 date 기준 outer 방식으로 병합한다."""
+    """Outer-join the series on observation date."""
+    if not series_ids:
+        raise ValueError("At least one series ID is required.")
     first_series_id = series_ids[0]
     macro_df = series_frames[first_series_id].copy()
 
@@ -467,23 +425,23 @@ def validate_macro_data(
     observation_start,
     observation_end,
 ):
-    """병합 결과의 column, 날짜, 월별 관측 수를 확인한다."""
+    """Validate merged columns, dates and monthly coverage."""
     expected_columns = ["date", *series_ids]
 
     if list(macro_df.columns) != expected_columns:
         raise ValueError(
-            "병합 결과 column 순서가 다릅니다: "
+            "Unexpected merged column order: "
             f"{list(macro_df.columns)}"
         )
 
     if macro_df["date"].isna().sum() != 0:
-        raise ValueError("병합 결과에 결측 날짜가 있습니다.")
+        raise ValueError("The merged data contains missing dates.")
 
     if macro_df["date"].duplicated().sum() != 0:
-        raise ValueError("병합 결과에 중복 날짜가 있습니다.")
+        raise ValueError("The merged data contains duplicate dates.")
 
     if not macro_df["date"].is_monotonic_increasing:
-        raise ValueError("병합 결과의 날짜가 오름차순이 아닙니다.")
+        raise ValueError("The merged dates are not sorted.")
 
     expected_monthly_dates = pd.date_range(
         start=observation_start,
@@ -507,26 +465,14 @@ def validate_macro_data(
             actual_date_set - expected_monthly_date_set
         )
 
-        print(
-            f"{series_id}_expected_month_count:",
-            len(expected_monthly_dates),
-        )
-        print(
-            f"{series_id}_actual_month_count:",
-            len(series_frames[series_id]),
-        )
-        print(
-            f"{series_id}_missing_month_count:",
-            len(missing_months),
-        )
-        print(
-            f"{series_id}_extra_date_count:",
-            len(extra_dates),
-        )
+        LOGGER.debug('%s %s', f"{series_id}_expected_month_count:", len(expected_monthly_dates))
+        LOGGER.debug('%s %s', f"{series_id}_actual_month_count:", len(series_frames[series_id]))
+        LOGGER.debug('%s %s', f"{series_id}_missing_month_count:", len(missing_months))
+        LOGGER.debug('%s %s', f"{series_id}_extra_date_count:", len(extra_dates))
 
         if missing_months or extra_dates:
             raise ValueError(
-                f"{series_id}의 월별 날짜 구성이 예상과 다릅니다."
+                f"{series_id} has unexpected monthly observation dates."
             )
 
     largest_source_row_count = max(
@@ -539,148 +485,68 @@ def validate_macro_data(
 
     if not merged_row_count_valid:
         raise ValueError(
-            "outer 병합 결과가 가장 긴 원본 DataFrame보다 짧습니다."
+            "The outer join has fewer rows than a source series."
         )
 
     missing_summary = macro_df[series_ids].isna().sum()
 
-    print("macro_row_count:", len(macro_df))
-    print("macro_column_count:", len(macro_df.columns))
-    print("macro_columns:", list(macro_df.columns))
-    print("macro_first_date:", macro_df["date"].min().date())
-    print("macro_last_date:", macro_df["date"].max().date())
-    print("merged_row_count_valid:", merged_row_count_valid)
-    print("macro_missing_summary:")
-    print(missing_summary)
+    LOGGER.debug('%s %s', "macro_row_count:", len(macro_df))
+    LOGGER.debug('%s %s', "macro_column_count:", len(macro_df.columns))
+    LOGGER.debug('%s %s', "macro_columns:", list(macro_df.columns))
+    LOGGER.debug('%s %s', "macro_first_date:", macro_df["date"].min().date())
+    LOGGER.debug('%s %s', "macro_last_date:", macro_df["date"].max().date())
+    LOGGER.debug('%s %s', "merged_row_count_valid:", merged_row_count_valid)
+    LOGGER.debug('%s', "macro_missing_summary:")
+    LOGGER.debug('%s', missing_summary)
 
 
 def save_and_check_macro_data(macro_df, output_csv_path):
-    """병합 결과를 CSV로 저장하고 다시 읽어 형태를 확인한다."""
-    if not output_csv_path.parent.exists():
-        raise FileNotFoundError(
-            "data 폴더가 없습니다. 프로젝트 루트에 "
-            "data 폴더를 만든 뒤 다시 실행하세요."
-        )
-
-    temporary_path = output_csv_path.with_suffix(".csv.tmp")
-    macro_df.to_csv(
-        temporary_path,
-        index=False,
-        date_format="%Y-%m-%d",
-    )
-    temporary_path.replace(output_csv_path)
-
-    saved_macro_df = pd.read_csv(
-        output_csv_path,
-        parse_dates=["date"],
-    )
-
-    if len(saved_macro_df) != len(macro_df):
-        raise ValueError("저장 전후 row 수가 다릅니다.")
-
-    if list(saved_macro_df.columns) != list(macro_df.columns):
-        raise ValueError("저장 전후 column 목록이 다릅니다.")
-
-    if saved_macro_df["date"].duplicated().sum() != 0:
-        raise ValueError("저장된 CSV에 중복 날짜가 있습니다.")
-
-    print("saved_csv_path:", output_csv_path)
-    print("saved_csv_exists:", output_csv_path.exists())
-    print("saved_row_count:", len(saved_macro_df))
-    print("saved_column_count:", len(saved_macro_df.columns))
-    print("saved_columns:", list(saved_macro_df.columns))
-    print("saved_first_date:", saved_macro_df["date"].min().date())
-    print("saved_last_date:", saved_macro_df["date"].max().date())
-
-    return saved_macro_df
+    """Validate a CSV round trip before replacing the saved file."""
+    if not output_csv_path.parent.is_dir():
+        raise FileNotFoundError("Create the data directory before collecting observations.")
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="", dir=output_csv_path.parent, prefix=output_csv_path.name+".", suffix=".tmp", delete=False) as stream:
+            temporary_path = Path(stream.name)
+            macro_df.to_csv(stream, index=False, date_format="%Y-%m-%d")
+        saved = pd.read_csv(temporary_path, parse_dates=["date"])
+        if saved["date"].isna().any() or saved["date"].duplicated().any():
+            raise ValueError("The saved CSV contains missing or duplicate dates.")
+        try:
+            pd.testing.assert_frame_equal(saved, macro_df.reset_index(drop=True), check_dtype=False, check_exact=False, rtol=1e-10, atol=1e-12)
+        except AssertionError as error:
+            raise ValueError("The CSV round trip changed the observations.") from error
+        temporary_path.replace(output_csv_path)
+        return saved
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description=(
-            "FRED 핵심 경제지표를 수집해 macro CSV를 "
-            "재생성합니다."
-        )
-    )
-    parser.add_argument(
-        "--refresh",
-        action="store_true",
-        help="유효한 캐시가 있어도 FRED API를 다시 요청합니다.",
-    )
+    parser = argparse.ArgumentParser(description="Collect the core FRED series and rebuild data/macro_data.csv.")
+    parser.add_argument("--refresh", action="store_true", help="Request data even when a fresh cache is available.")
+    parser.add_argument("--verbose", action="store_true", help="Show collection and validation details.")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-
-    print("project_root:", PROJECT_ROOT)
-    print("env_file_exists:", ENV_PATH.exists())
-    print("output_csv_path:", OUTPUT_CSV_PATH)
-    print("observation_start:", OBSERVATION_START)
-    print("observation_end:", OBSERVATION_END)
-    print("series_ids:", SERIES_IDS)
-
-    for series_id in SERIES_IDS:
-        metadata = SERIES_METADATA[series_id]
-        print(
-            "series_metadata:",
-            series_id,
-            metadata["unit"],
-            metadata["frequency"],
-            metadata["seasonal_adjustment"],
-            metadata["source_name"],
-        )
-
+    logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
+    LOGGER.setLevel(logging.DEBUG if args.verbose else logging.INFO)
     try:
-        fred_api_key = load_fred_api_key(ENV_PATH)
-        print("fred_api_key_loaded:", True)
-
+        api_key = load_fred_api_key(ENV_PATH)
         with requests.Session() as session:
-            series_frames = collect_fred_series(
-                series_ids=SERIES_IDS,
-                api_key=fred_api_key,
-                observation_start=OBSERVATION_START,
-                observation_end=OBSERVATION_END,
-                session=session,
-                refresh_cache=args.refresh,
-            )
-
-        macro_df = merge_fred_series(
-            series_frames=series_frames,
-            series_ids=SERIES_IDS,
-        )
-
-        validate_macro_data(
-            macro_df=macro_df,
-            series_frames=series_frames,
-            series_ids=SERIES_IDS,
-            observation_start=OBSERVATION_START,
-            observation_end=OBSERVATION_END,
-        )
-
-        saved_macro_df = save_and_check_macro_data(
-            macro_df=macro_df,
-            output_csv_path=OUTPUT_CSV_PATH,
-        )
-
-    except (
-        ValueError,
-        KeyError,
-        TypeError,
-        OSError,
-        RuntimeError,
-        requests.RequestException,
-    ) as error:
-        print("collection_complete:", False)
-        print("error_type:", type(error).__name__)
-        print("error_message:", str(error))
+            frames = collect_fred_series(SERIES_IDS, api_key, OBSERVATION_START, OBSERVATION_END, session, refresh_cache=args.refresh)
+        macro_df = merge_fred_series(frames, SERIES_IDS)
+        validate_macro_data(macro_df, frames, SERIES_IDS, OBSERVATION_START, OBSERVATION_END)
+        saved = save_and_check_macro_data(macro_df, OUTPUT_CSV_PATH)
+    except (ValueError, KeyError, TypeError, OSError, RuntimeError, requests.RequestException) as error:
+        LOGGER.error("Collection failed: %s", error)
         return 1
-
-    print("collection_complete:", True)
-    print(saved_macro_df.head())
+    print(f"Saved {len(saved)} rows and {len(saved.columns)} columns to {OUTPUT_CSV_PATH}")
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

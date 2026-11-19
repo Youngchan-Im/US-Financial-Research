@@ -1,27 +1,75 @@
-# U.S Financial Research Porject
+# U.S. Financial Research
 
-## Project one-line description
+A small research project combining SEC company financials with FRED macroeconomic data. It follows Apple, Microsoft, JPMorgan Chase, Tesla and Walmart across their fiscal periods, with source metadata and coverage checks kept alongside the numbers.
 
-U.S. Financial Research Project는 미국 주요 기업의 재무지표와 거시경제 지표를 함께 정리해 기업별 흐름을 설명하는 데이터 리서치 프로젝트
+The current workflow collects the source data, builds a panel for each company and fiscal year and compares financial results with macro conditions. The saved annual panel is descriptive; the Numerai Signals extension is separate work.
 
-## Goal
+## Run locally
 
-미국 기업과 시장 데이터를 수집, 정리, 해석하는 과정을 기록한다. 결과는 리서치 노트와 데이터 분석 산출물로 관리한다.
+From the project root in PowerShell:
 
-## Interest company candidates
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe scripts/check_project.py
+```
 
-`ticker`는 거래소에서 기업을 식별할 때 쓰는 짧은 기호다.
+The check uses saved files and does not contact SEC or FRED. It also recomputes the saved fiscal-period macro summaries. Run the offline regression tests with:
 
-| company_name | ticker | reason |
-|---|---|---|
-| Apple Inc. | AAPL | 제품 매출과 서비스 매출을 함께 볼 수 있음 |
-| Microsoft Corporation | MSFT | 클라우드와 소프트웨어 중심의 재무 흐름을 볼 수 있음 |
-| JPMorgan Chase & Co. | JPM | 금리 환경과 금융업 실적의 관계를 살펴 볼 수 있음 |
-| Tesla, Inc. | TSLA | 성장 기업의 매출 확대와 수익성 변화를 볼 수 있음 |
-| Walmart Inc. | WMT | 소비 경기와 대형 유통 기업의 흐름을 비교할 수 있음 |
-| Meta Platforms, Inc. | META | 소셜 미디어와 디지털 광고 중심의 사업 구조를 살펴볼 수 있음 |
-| Amazon.com, Inc. | AMZN | 전자상거래와 클라우드 사업 구조를 함께 살펴볼 수 있음 |
-| NVIDIA Corporation | NVDA | AI 반도체와 데이터센터 사업의 성장 흐름을 살펴볼 수 있음 |
-| Alphabet Inc. | GOOGL | 검색 광고와 클라우드 중심 사업 구조를 살펴볼 수 있음 |
-| Advanced Micro Devices, Inc. | AMD | AI 반도체와 고성능 컴퓨팅 사업의 경쟁 구조를 살펴볼 수 있음 |
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+```
 
+To rebuild the macro chart from the saved CSV:
+
+```powershell
+.\.venv\Scripts\python.exe scripts/plot_macro.py
+```
+
+Open `notebooks/09_company_macro_merge.ipynb` in Jupyter or VS Code, select the same environment, restart the kernel and run all cells to rebuild `data/company_macro_panel.csv`. The notebook reads the two saved source CSVs. The earlier numbered notebooks contain the Python, pandas and API exercises used to build this workflow; the API exercises need network access and local credentials.
+
+If `nbconvert` is installed, the merge can also run from the terminal:
+
+```powershell
+.\.venv\Scripts\python.exe -m jupyter nbconvert --to notebook --execute --inplace notebooks/09_company_macro_merge.ipynb
+.\.venv\Scripts\python.exe scripts/check_project.py
+```
+
+## Refresh source data
+
+The collectors use `FRED_API_KEY` and `SEC_CONTACT_EMAIL` from the project's local `.env`. The required names are listed in `.env.example`. Keep credentials and contact details out of version control.
+
+```powershell
+.\.venv\Scripts\python.exe src/fred_api.py
+.\.venv\Scripts\python.exe src/sec_api.py
+```
+
+These commands collect data and write the source CSVs. Responses are cached in `data/cache/`; `--refresh` requests fresh responses. Add `--verbose` when you need collection diagnostics. The configured periods are 2019-2024 for FRED and fiscal years 2021-2025 for company financials. After refreshing, rerun the merge and check the coverage before interpreting the panel.
+
+## Files
+
+| Location | Contents |
+|---|---|
+| `src/fred_api.py` | FRED collection, validation and caching |
+| `src/sec_api.py` | SEC companyfacts collection and financial-period checks |
+| `data/macro_data.csv` | Five macro series joined on observation date |
+| `data/company_financials.csv` | Annual financials and filing metadata for five companies |
+| `data/company_macro_panel.csv` | Financials joined to macro summaries over each fiscal period |
+| `notebooks/09_company_macro_merge.ipynb` | Panel construction and descriptive analysis |
+| `docs/company_list.md` | Company selection, CIKs and revenue concepts |
+| `docs/data_dictionary.md` | Fields, units, coverage and interpretation limits |
+| `assets/` | Saved charts |
+
+The [data dictionary](docs/data_dictionary.md) explains the mixed frequencies, fiscal calendars and incomplete macro coverage. Do not treat the annual panel as information that was necessarily available at a historical prediction date.
+
+## Numerai Signals
+
+The forecasting extension currently defines the dataset, target, feature availability policy and submission constraints in `config/signals.json`. Validate the configuration with:
+
+```powershell
+.\.venv\Scripts\python.exe -m src.signals validate-config
+```
+
+An isolated competition environment, data ingestion and model evaluation are the next steps. Label calendar resolution is still pending. The annual research panel needs historical filing availability before it can supply prediction features, and macro inputs remain disabled until source use is resolved.
+
+See [Signals data](https://docs.numer.ai/numerai-signals/data) and the [target definition](https://docs.numer.ai/numerai-signals/signals-overview).

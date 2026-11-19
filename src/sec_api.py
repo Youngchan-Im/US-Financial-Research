@@ -1,13 +1,19 @@
 import argparse
 from getpass import getpass
 import json
+import logging
+import math
 import os
 from pathlib import Path
 import time
+import tempfile
 
 import pandas as pd
 import requests
 from dotenv import load_dotenv
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -31,8 +37,7 @@ RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
 
 
 class TransientRequestError(RuntimeError):
-    """재시도 뒤에도 끝나지 않은 일시적 요청 오류다."""
-
+    """A temporary request failure that persisted after retries."""
 
 
 FISCAL_YEAR_START = 2021
@@ -193,7 +198,7 @@ def build_sec_headers(contact_email):
     normalized_email = contact_email.strip()
 
     if not normalized_email or "@" not in normalized_email:
-        raise ValueError("연락 가능한 이메일 형식을 입력하세요.")
+        raise ValueError("Enter a valid contact email address.")
 
     return {
         "User-Agent": (
@@ -225,12 +230,12 @@ def load_json_cache(cache_path, max_age_hours=None):
         payload = json.loads(cache_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise ValueError(
-            f"캐시 JSON을 읽지 못했습니다: {cache_path}"
+            f"Cannot read cache JSON: {cache_path}"
         ) from error
 
     if not isinstance(payload, dict):
         raise TypeError(
-            f"캐시 JSON 최상위 구조가 딕셔너리가 아닙니다: "
+            f"Cache JSON must be an object: "
             f"{cache_path}"
         )
 
@@ -261,74 +266,42 @@ def retry_wait_seconds(response, attempt):
 
 
 def request_sec_json(session, url, headers):
-    last_error = None
-
+    """Request SEC JSON with bounded retries for temporary failures."""
     for attempt in range(1, MAX_RETRIES + 1):
         time.sleep(REQUEST_INTERVAL_SECONDS)
-
         try:
-            response = session.get(
-                url,
-                headers=headers,
-                timeout=REQUEST_TIMEOUT_SECONDS,
-            )
-
-            if response.status_code in RETRY_STATUS_CODES:
-                if attempt == MAX_RETRIES:
-                    raise TransientRequestError(
-                        "SEC request가 일시적 HTTP 오류 상태로 "
-                        f"종료되었습니다: {response.status_code}"
-                    )
-
-                wait_seconds = retry_wait_seconds(
-                    response=response,
-                    attempt=attempt,
-                )
-                print(
-                    "sec_retry:",
-                    f"attempt={attempt}",
-                    f"status={response.status_code}",
-                    f"wait_seconds={wait_seconds}",
-                )
-                time.sleep(wait_seconds)
-                continue
-
-            response.raise_for_status()
-            payload = response.json()
-
-            if not isinstance(payload, dict):
-                raise TypeError(
-                    "SEC JSON 최상위 구조가 딕셔너리가 아닙니다."
-                )
-
-            return payload
-
-        except (requests.Timeout, requests.ConnectionError) as error:
-            last_error = error
+            response = session.get(url, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
+        except (requests.Timeout, requests.ConnectionError):
             if attempt == MAX_RETRIES:
                 break
-
-            wait_seconds = BACKOFF_BASE_SECONDS * (
-                2 ** (attempt - 1)
+            wait = BACKOFF_BASE_SECONDS * (2 ** (attempt - 1))
+            LOGGER.warning(
+                "SEC connection failed; retrying in %.1f seconds (%d/%d).",
+                wait, attempt, MAX_RETRIES,
             )
-            print(
-                "sec_retry:",
-                f"attempt={attempt}",
-                "status=network_error",
-                f"wait_seconds={wait_seconds}",
+            time.sleep(wait)
+            continue
+        if response.status_code in RETRY_STATUS_CODES:
+            if attempt == MAX_RETRIES:
+                raise TransientRequestError(
+                    f"SEC request failed after retries (HTTP {response.status_code})."
+                )
+            wait = retry_wait_seconds(response, attempt)
+            LOGGER.warning(
+                "SEC returned HTTP %d; retrying in %.1f seconds (%d/%d).",
+                response.status_code, wait, attempt, MAX_RETRIES,
             )
-            time.sleep(wait_seconds)
-
-        except requests.RequestException:
-            raise
-        except ValueError as error:
-            raise ValueError(
-                "SEC response를 JSON으로 변환하지 못했습니다."
-            ) from error
-
-    raise TransientRequestError(
-        "SEC request가 재시도 횟수를 초과했습니다."
-    ) from last_error
+            time.sleep(wait)
+            continue
+        response.raise_for_status()
+        try:
+            payload = response.json()
+        except ValueError:
+            raise ValueError("SEC returned invalid JSON.") from None
+        if not isinstance(payload, dict):
+            raise TypeError("SEC JSON must be an object.")
+        return payload
+    raise TransientRequestError("SEC request failed after all retry attempts.") from None
 
 
 def get_sec_json(
@@ -352,22 +325,23 @@ def get_sec_json(
             url=url,
             headers=headers,
         )
+        if "/api/xbrl/companyfacts/CIK" in url:
+            expected_cik = url.rsplit("CIK", 1)[-1].split(".json", 1)[0]
+            actual_cik = str(payload.get("cik", "")).zfill(10)
+            if actual_cik != expected_cik or not isinstance(payload.get("facts"), dict) or not payload["facts"]:
+                raise ValueError("SEC companyfacts response does not match the requested CIK or fact structure.")
         write_json_cache(
             cache_path=cache_path,
             payload=payload,
         )
         return payload, "network"
-    except TransientRequestError as error:
+    except TransientRequestError:
         stale_payload = load_json_cache(
             cache_path=cache_path,
             max_age_hours=None,
         )
         if stale_payload is not None:
-            print(
-                "sec_cache_fallback:",
-                cache_path.name,
-                type(error).__name__,
-            )
+            LOGGER.warning("Using stale SEC cache %s after a temporary request failure.", cache_path.name)
             return stale_payload, "stale_cache"
         raise
 
@@ -385,14 +359,14 @@ def concept_usd_facts_to_df(
         usd_records = concept_data["units"]["USD"]
     except KeyError as error:
         raise KeyError(
-            f"{concept_id}의 USD facts 경로를 찾지 못했습니다."
+            f"{concept_id} has no USD fact records."
         ) from error
 
     facts_df = pd.DataFrame(usd_records)
 
     if facts_df.empty:
         raise ValueError(
-            f"{concept_id}의 USD fact record가 없습니다."
+            f"{concept_id} has no USD fact records."
         )
 
     required_columns = [
@@ -412,7 +386,7 @@ def concept_usd_facts_to_df(
 
     if missing_columns:
         raise ValueError(
-            f"{concept_id} facts에 필요한 column이 없습니다: "
+            f"{concept_id} facts are missing required columns: "
             f"{missing_columns}"
         )
 
@@ -462,12 +436,7 @@ def report_fiscal_year_context(annual_df, concept_id):
         )
     ].shape[0]
 
-    print(
-        "fiscal_year_context:",
-        concept_id,
-        f"candidate_rows={len(annual_df)}",
-        f"reported_fy_mismatch_count={mismatch_count}",
-    )
+    LOGGER.debug('%s %s %s %s', "fiscal_year_context:", concept_id, f"candidate_rows={len(annual_df)}", f"reported_fy_mismatch_count={mismatch_count}")
 
 
 def select_latest_record_per_fiscal_year(facts_df):
@@ -517,8 +486,8 @@ def extract_annual_duration_facts(
 
     if annual_df.empty:
         raise ValueError(
-            f"{concept_id}에서 지정 범위의 duration facts를 "
-            "찾지 못했습니다."
+            f"{concept_id} has no duration facts "
+            "in the requested year range."
         )
 
     report_fiscal_year_context(
@@ -588,8 +557,8 @@ def extract_annual_instant_facts(
 
     if annual_df.empty:
         raise ValueError(
-            f"{concept_id}에서 지정 범위의 instant facts를 "
-            "찾지 못했습니다."
+            f"{concept_id} has no instant facts "
+            "in the requested year range."
         )
 
     report_fiscal_year_context(
@@ -645,7 +614,7 @@ def empty_metric_frame(metric_name, fact_type):
         ]
     else:
         raise ValueError(
-            f"지원하지 않는 fact_type입니다: {fact_type}"
+            f"Unsupported fact type: {fact_type}"
         )
 
     return pd.DataFrame(columns=columns)
@@ -752,7 +721,7 @@ def resolve_metric_frame(
 def merge_metric_frame(left_df, right_df, metric_name):
     if right_df["fiscal_year"].duplicated().any():
         raise ValueError(
-            f"{metric_name} frame에 fiscal_year 중복이 있습니다."
+            f"{metric_name} has duplicate fiscal-year records."
         )
 
     return left_df.merge(
@@ -806,7 +775,7 @@ def build_company_financials(
 
     if payload_cik != company_config["cik_int"]:
         raise ValueError(
-            f"{ticker} companyfacts의 CIK가 설정값과 다릅니다."
+            f"{ticker} companyfacts CIK does not match the configuration."
         )
 
     fiscal_years = list(
@@ -940,35 +909,44 @@ def validate_company_financials(
 
     if list(company_financials_df.columns) != FINAL_COLUMNS:
         raise ValueError(
-            f"{ticker}의 최종 column 순서가 기준과 다릅니다."
+            f"{ticker}: unexpected final column order."
         )
 
     if actual_fiscal_years != expected_fiscal_years:
         raise ValueError(
-            f"{ticker}의 회계연도 범위가 2021~2025와 "
-            "일치하지 않습니다."
+            f"{ticker}: fiscal years must cover 2021-2025"
+            "."
         )
 
     if company_financials_df["fiscal_year"].duplicated().any():
         raise ValueError(
-            f"{ticker}의 fiscal_year 중복이 있습니다."
+            f"{ticker}: duplicate fiscal years."
         )
 
-    if not company_financials_df["ticker"].eq(ticker).all():
-        raise ValueError(f"{ticker} ticker 값이 섞여 있습니다.")
+    if not company_financials_df["ticker"].eq(ticker).fillna(False).all():
+        raise ValueError(f"{ticker}: unexpected ticker values.")
 
-    if not company_financials_df["cik"].eq(expected_cik).all():
+    if not company_financials_df["cik"].eq(expected_cik).fillna(False).all():
         raise ValueError(
-            f"{ticker} CIK가 10자리 설정값과 다릅니다."
+            f"{ticker}: CIK does not match the configured ten-digit identifier."
         )
 
     if company_financials_df[
         "metric_coverage_count"
     ].lt(3).any():
         raise ValueError(
-            f"{ticker}의 일부 회계연도에서 수집된 지표가 "
-            "3개보다 적습니다."
+            f"{ticker}: some fiscal years have "
+            "fewer than three available metrics."
         )
+
+    for column in METRIC_VALUE_COLUMNS:
+        values = company_financials_df[column].dropna()
+        try:
+            finite = pd.to_numeric(values, errors="raise").map(math.isfinite).all()
+        except (TypeError, ValueError):
+            finite = False
+        if not finite:
+            raise ValueError(f"{ticker}: {column} must contain finite numeric values.")
 
     positive_when_present = [
         "revenue_usd",
@@ -980,7 +958,7 @@ def validate_company_financials(
         values = company_financials_df[column].dropna()
         if not values.gt(0).all():
             raise ValueError(
-                f"{ticker}의 {column}에 0 이하 값이 있습니다."
+                f"{ticker}: {column} contains nonpositive values."
             )
 
     for metric_name in METRIC_NAMES:
@@ -997,14 +975,14 @@ def validate_company_financials(
             [concept_column, filed_column, accn_column],
         ].isna().any().any():
             raise ValueError(
-                f"{ticker}의 {metric_name} 출처 추적 column에 "
-                "결측치가 있습니다."
+                f"{ticker}: {metric_name} provenance contains "
+                "missing values."
             )
 
     for flag_column in QUALITY_FLAG_COLUMNS:
         if company_financials_df[flag_column].eq(False).any():
             raise ValueError(
-                f"{ticker}의 {flag_column} 검수가 실패했습니다."
+                f"{ticker}: {flag_column} failed validation."
             )
 
 
@@ -1042,15 +1020,10 @@ def collect_all_company_financials(
             OSError,
         ) as error:
             raise RuntimeError(
-                f"{ticker} companyfacts 수집에 실패했습니다."
+                f"{ticker} companyfacts collection failed."
             ) from error
 
-        print(
-            "sec_payload_source:",
-            ticker,
-            cache_status,
-            cache_path.name,
-        )
+        LOGGER.debug('%s %s %s %s', "sec_payload_source:", ticker, cache_status, cache_path.name)
         company_financials_df, diagnostics = (
             build_company_financials(
                 companyfacts_json=companyfacts_json,
@@ -1099,23 +1072,23 @@ def validate_combined_financials(combined_df):
     )
 
     if list(combined_df.columns) != FINAL_COLUMNS:
-        raise ValueError("통합 CSV의 column 순서가 다릅니다.")
+        raise ValueError("Unexpected combined CSV column order.")
 
     if actual_tickers != expected_tickers:
-        raise ValueError("통합 데이터의 ticker 구성이 다릅니다.")
+        raise ValueError("Unexpected tickers in the combined data.")
 
     if len(combined_df) != expected_row_count:
         raise ValueError(
-            f"통합 데이터가 {expected_row_count}행이 아닙니다."
+            f"Expected {expected_row_count} rows in the combined data."
         )
 
     if combined_df.duplicated(
         subset=["ticker", "fiscal_year"]
     ).any():
-        raise ValueError("ticker·fiscal_year 중복이 있습니다.")
+        raise ValueError("Duplicate ticker/fiscal-year keys.")
 
-    if not combined_df["cik"].str.fullmatch(r"\d{10}").all():
-        raise ValueError("10자리 문자열이 아닌 CIK가 있습니다.")
+    if not combined_df["cik"].astype("string").str.fullmatch(r"[0-9]{10}").fillna(False).all():
+        raise ValueError("CIKs must be ten-digit strings.")
 
     rows_per_ticker = combined_df.groupby(
         "ticker"
@@ -1126,12 +1099,17 @@ def validate_combined_financials(combined_df):
 
     if not rows_per_ticker.eq(expected_year_count).all():
         raise ValueError(
-            "기업별 회계연도 개수가 5개로 맞지 않습니다."
+            "Each company must have five fiscal years."
+        )
+
+    for ticker, company_config in COMPANY_CONFIGS.items():
+        validate_company_financials(
+            combined_df.loc[combined_df["ticker"].eq(ticker)], ticker, company_config
         )
 
     if combined_df["metric_coverage_count"].lt(3).any():
         raise ValueError(
-            "수집 지표가 3개보다 적은 기업·회계연도가 있습니다."
+            "Some company-year rows have fewer than three available metrics."
         )
 
 
@@ -1147,7 +1125,7 @@ def normalize_nullable_boolean_series(series):
             return False
 
         raise ValueError(
-            f"boolean으로 바꿀 수 없는 값입니다: {value}"
+            f"Invalid boolean value: {value}"
         )
 
     return series.map(normalize_value).astype("boolean")
@@ -1175,33 +1153,35 @@ def reload_company_financials(csv_path):
             )
         )
 
+    reloaded_df["missing_metrics"] = reloaded_df["missing_metrics"].fillna("")
     return reloaded_df
 
 
 def save_company_financials(combined_df, csv_path):
+    """Validate the temporary CSV before replacing the last good dataset."""
+    validate_combined_financials(combined_df)
     csv_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = csv_path.with_suffix(".csv.tmp")
-
-    combined_df.to_csv(
-        temporary_path,
-        index=False,
-        date_format="%Y-%m-%d",
-    )
-    temporary_path.replace(csv_path)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="", dir=csv_path.parent, prefix=csv_path.name+".", suffix=".tmp", delete=False) as stream:
+            temporary_path = Path(stream.name)
+            combined_df.to_csv(stream, index=False, date_format="%Y-%m-%d")
+        reloaded = reload_company_financials(temporary_path)
+        validate_combined_financials(reloaded)
+        try:
+            pd.testing.assert_frame_equal(reloaded, combined_df.reset_index(drop=True), check_dtype=False, check_exact=False, rtol=1e-10, atol=1e-12)
+        except AssertionError as error:
+            raise ValueError("The CSV round trip changed the financial data.") from error
+        temporary_path.replace(csv_path)
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description=(
-            "SEC companyfacts를 수집해 다섯 기업 재무 CSV를 "
-            "재생성합니다."
-        )
-    )
-    parser.add_argument(
-        "--refresh",
-        action="store_true",
-        help="유효한 캐시가 있어도 SEC API를 다시 요청합니다.",
-    )
+    parser = argparse.ArgumentParser(description="Collect SEC companyfacts and rebuild data/company_financials.csv.")
+    parser.add_argument("--refresh", action="store_true", help="Request data even when a fresh cache is available.")
+    parser.add_argument("--verbose", action="store_true", help="Show concept selection and validation details.")
     return parser.parse_args()
 
 
@@ -1211,7 +1191,7 @@ def load_sec_contact_email(env_path):
 
     if not contact_email:
         contact_email = getpass(
-            "SEC User-Agent에 사용할 연락 가능한 이메일: "
+            "Contact email for the SEC User-Agent: "
         ).strip()
 
     return contact_email
@@ -1219,60 +1199,20 @@ def load_sec_contact_email(env_path):
 
 def main():
     args = parse_args()
-
+    logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
+    LOGGER.setLevel(logging.DEBUG if args.verbose else logging.INFO)
     try:
-        contact_email = load_sec_contact_email(ENV_PATH)
-        headers = build_sec_headers(contact_email)
-
+        headers = build_sec_headers(load_sec_contact_email(ENV_PATH))
         with requests.Session() as session:
-            combined_df, diagnostics_df = (
-                collect_all_company_financials(
-                    headers=headers,
-                    session=session,
-                    refresh_cache=args.refresh,
-                )
-            )
-
-        validate_combined_financials(combined_df)
-        save_company_financials(
-            combined_df=combined_df,
-            csv_path=CSV_OUTPUT_PATH,
-        )
-
-        reloaded_df = reload_company_financials(
-            csv_path=CSV_OUTPUT_PATH,
-        )
-        validate_combined_financials(reloaded_df)
-
-    except (
-        ValueError,
-        KeyError,
-        TypeError,
-        OSError,
-        RuntimeError,
-        requests.RequestException,
-    ) as error:
-        print("collection_complete:", False)
-        print("error_type:", type(error).__name__)
-        print("error_message:", str(error))
+            combined, diagnostics = collect_all_company_financials(headers, session, refresh_cache=args.refresh)
+        validate_combined_financials(combined)
+        save_company_financials(combined, CSV_OUTPUT_PATH)
+        reloaded = reload_company_financials(CSV_OUTPUT_PATH)
+        LOGGER.debug("Selected concepts and coverage:\n%s", diagnostics.to_string(index=False))
+    except (ValueError, KeyError, TypeError, OSError, RuntimeError, requests.RequestException) as error:
+        LOGGER.error("Collection failed: %s", error)
         return 1
-
-    print("\n선택된 concept과 회계연도 coverage")
-    print(diagnostics_df.to_string(index=False))
-    print("\n기업별 row 수")
-    print(
-        reloaded_df.groupby("ticker").size().to_string()
-    )
-    print("\n기업별·지표별 결측치 수")
-    print(
-        reloaded_df.groupby("ticker")[
-            METRIC_VALUE_COLUMNS
-        ].apply(lambda frame: frame.isna().sum())
-    )
-    print("\n저장 결과")
-    print(f"shape: {reloaded_df.shape}")
-    print(f"saved: {CSV_OUTPUT_PATH}")
-    print("collection_complete:", True)
+    print(f"Saved {len(reloaded)} rows and {len(reloaded.columns)} columns to {CSV_OUTPUT_PATH}")
     return 0
 
 
