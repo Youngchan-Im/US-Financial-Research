@@ -4,9 +4,11 @@ import ast
 from contextlib import redirect_stdout
 import io
 import json
+import os
 from pathlib import Path
 import re
 import unittest
+from unittest.mock import patch
 import numpy as np
 import pandas as pd
 
@@ -55,6 +57,35 @@ class NotebookChecks(unittest.TestCase):
             source='\n'.join(''.join(c['source']) for c in notebook(name)['cells'])
             self.assertNotIn('APPL',source)
             self.assertIn('AAPL',source)
+
+    def test_sec_setup_requires_configured_contact_without_prompting(self):
+        contact = 'student@example.test'
+        for name in ['07_sec_structure_apple.ipynb', '08_sec_apple_metric.ipynb']:
+            for configured in [False, True]:
+                with self.subTest(notebook=name, configured=configured):
+                    values = {'SEC_CONTACT_EMAIL': contact} if configured else {}
+                    output = io.StringIO()
+                    with (
+                        patch.dict(os.environ, values, clear=True),
+                        patch('dotenv.load_dotenv', return_value=False) as load_env,
+                        patch('builtins.input', side_effect=AssertionError('Unexpected prompt')),
+                        patch('getpass.getpass', side_effect=AssertionError('Unexpected prompt')),
+                        patch('requests.sessions.Session.request', side_effect=AssertionError('Unexpected network')),
+                        patch('urllib.request.urlopen', side_effect=AssertionError('Unexpected network')),
+                        redirect_stdout(output),
+                    ):
+                        env = {'project_root': ROOT, 'os': os, 'load_dotenv': load_env}
+                        if configured:
+                            exec(cell(name, 3), env)
+                            self.assertEqual(
+                                env['sec_headers']['User-Agent'],
+                                f'U.S. Financial Research Project {contact}',
+                            )
+                        else:
+                            with self.assertRaisesRegex(ValueError, 'SEC_CONTACT_EMAIL'):
+                                exec(cell(name, 3), env)
+                            self.assertNotIn('sec_headers', env)
+                    self.assertNotIn(contact, output.getvalue())
 
     def test_fred_mask_preview(self):
         env={'json':json,'fred_api_key':'synthetic_not_a_real_key'}
